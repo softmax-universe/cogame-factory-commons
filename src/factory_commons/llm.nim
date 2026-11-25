@@ -7,12 +7,12 @@
 ## the next shift.
 ##
 ## Decisions within a shift are SIMULTANEOUS by rule, so all open prompt seats
-## go out as ONE parallel batch (`curly.makeRequests`); invalid replies are
-## retried once as a smaller batch with a hint, and any seat still failing
-## raises `DecisionError` (distinguishing infrastructure/provider failures from
-## model-generated invalid replies) so the server terminates the unfinished
-## episode unscored with failure diagnostics rather than silently substituting
-## a scripted move or inventing a forfeit score. Deciding in the GAME container
+## go out as ONE parallel batch (`curly.makeRequests`); any seat failing
+## raises `DecisionError` immediately without retrying model calls
+## (distinguishing infrastructure/provider failures from model-generated
+## invalid replies) so the server terminates the unfinished episode unscored
+## with failure diagnostics rather than silently substituting a scripted move
+## or inventing a forfeit score. Deciding in the GAME container
 ## is what makes one parallel batch per turn possible, and is why the coworld
 ## secret must be on the game runnable (hive, 2026-08-23).
 ##
@@ -859,8 +859,8 @@ proc decideAll*(
   selection: PromptSelection
 ): seq[Order] =
   ## One order per seat in `seats`, in order. Genuine scripted seats run their
-  ## baseline deterministically; prompt seats go out in ONE parallel batch with
-  ## at most one retry batch for invalid replies. Never silently substitutes a
+  ## baseline deterministically; prompt seats go out in ONE parallel batch
+  ## without retrying failed model calls. Never silently substitutes a
   ## scripted fallback move — raises `DecisionError` if any prompt seat fails,
   ## preserving whether the cause was infrastructure/provider or a model-
   ## generated unparseable/invalid action.
@@ -888,26 +888,24 @@ proc decideAll*(
     else:
       open.add(index)
 
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
+  if open.len > 0 and not client.disabled:
     var batch: RequestBatch
     for index in open:
       let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-          "requested JSON object, using one of the listed job and cube values.")
+      let user = sim.userPrompt(seat, prompts[seat])
       let request = client.requestFor(sim.systemPrompt(seat, selection), user, seat)
       batch.post(request.url, request.headers, request.body, $index)
     client.lastBatchSize = batch.len
     client.batches += 1
-    var responses: ResponseBatch
+    var
+      responses: ResponseBatch
+      transportRaised = false
     try:
       responses =
         if client.stub != nil: client.stub(batch)
         else: client.curl.makeRequests(batch, client.timeoutSeconds)
     except CatchableError as error:
+      transportRaised = true
       let msg = "llm batch transport raised: " & cleanError(error.msg)
       log msg
       for index in open:
@@ -915,60 +913,57 @@ proc decideAll*(
         lastKinds[index] = fkInfra
         lastCodes[index] = "llm_transport_error"
         lastRejected[index] = ""
-      break
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      if position >= responses.len:
-        lastErrors[index] = "missing response from LLM batch"
-        lastKinds[index] = fkInfra
-        lastCodes[index] = "llm_transport_error"
-        lastRejected[index] = ""
-        stillOpen.add(index)
-        continue
-      var replyText = ""
-      try:
-        replyText = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url, seat)
-        var order = parseOrder(extractJsonObject(replyText))
-        order.source = if attempt == 0: osLlm else: osRetry
-        result[index] = order
-      except ThrottledError as error:
-        let msg = cleanError(error.msg)
-        log "llm: seat " & $seat & " throttled: " & msg
-        lastErrors[index] = msg
-        lastKinds[index] = fkInfra
-        lastCodes[index] = "llm_throttled"
-        lastRejected[index] = ""
         failed.add(index)
-      except DecisionError as error:
-        let msg = cleanError(error.msg)
-        log "llm: seat " & $seat & " attempt " & $attempt & " failed: " & msg
-        lastErrors[index] = msg
-        lastKinds[index] = error.kind
-        lastCodes[index] = error.code
-        lastRejected[index] = error.rejectedAction
-        stillOpen.add(index)
-      except FactoryError as error:
-        let msg = cleanError(error.msg)
-        log "llm: seat " & $seat & " attempt " & $attempt & " invalid reply: " & msg
-        lastErrors[index] = msg
-        lastKinds[index] = fkModelAction
-        lastCodes[index] = "llm_invalid_reply"
-        lastRejected[index] = cleanError(replyText)
-        stillOpen.add(index)
-      except CatchableError as error:
-        let msg = cleanError(error.msg)
-        log "llm: seat " & $seat & " attempt " & $attempt & " failed: " & msg
-        lastErrors[index] = msg
-        lastKinds[index] = fkInfra
-        lastCodes[index] = "llm_provider_error"
-        lastRejected[index] = ""
-        stillOpen.add(index)
-    open = stillOpen
+    if not transportRaised:
+      for position, index in open:
+        let seat = seats[index]
+        if position >= responses.len:
+          lastErrors[index] = "missing response from LLM batch"
+          lastKinds[index] = fkInfra
+          lastCodes[index] = "llm_transport_error"
+          lastRejected[index] = ""
+          failed.add(index)
+          continue
+        var replyText = ""
+        try:
+          replyText = client.textOf(responses[position].response,
+            responses[position].error, batch[position].url, seat)
+          var order = parseOrder(extractJsonObject(replyText))
+          order.source = osLlm
+          result[index] = order
+        except ThrottledError as error:
+          let msg = cleanError(error.msg)
+          log "llm: seat " & $seat & " throttled: " & msg
+          lastErrors[index] = msg
+          lastKinds[index] = fkInfra
+          lastCodes[index] = "llm_throttled"
+          lastRejected[index] = ""
+          failed.add(index)
+        except DecisionError as error:
+          let msg = cleanError(error.msg)
+          log "llm: seat " & $seat & " failed: " & msg
+          lastErrors[index] = msg
+          lastKinds[index] = error.kind
+          lastCodes[index] = error.code
+          lastRejected[index] = error.rejectedAction
+          failed.add(index)
+        except FactoryError as error:
+          let msg = cleanError(error.msg)
+          log "llm: seat " & $seat & " invalid reply: " & msg
+          lastErrors[index] = msg
+          lastKinds[index] = fkModelAction
+          lastCodes[index] = "llm_invalid_reply"
+          lastRejected[index] = cleanError(replyText)
+          failed.add(index)
+        except CatchableError as error:
+          let msg = cleanError(error.msg)
+          log "llm: seat " & $seat & " failed: " & msg
+          lastErrors[index] = msg
+          lastKinds[index] = fkInfra
+          lastCodes[index] = "llm_provider_error"
+          lastRejected[index] = ""
+          failed.add(index)
 
-  for index in open:
-    failed.add(index)
   if failed.len > 0:
     let first = failed[0]
     let seat = seats[first]

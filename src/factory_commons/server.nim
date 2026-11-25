@@ -316,34 +316,45 @@ proc failEpisode(
   ## Explicit failure lifecycle for unfinished/failed episodes (infrastructure,
   ## credential, transport, timeout, disconnect, or model-generated illegal/
   ## unparseable action). Never invents a forfeit, authoritative gameplay scores,
-  ## or winners: writes structured failure diagnostics to
-  ## `COGAME_PLAYER_FAILURE_URI` (when configured), notifies connected players,
-  ## omits `results.json`, and exits non-zero.
-  var failureJson: JsonNode
+  ## or winners: writes Coworld's closed `GamePlayerFailure` JSON to
+  ## `COGAME_PLAYER_FAILURE_URI` (when configured and a real seat failed),
+  ## logs full game-specific diagnostics, notifies connected players, omits
+  ## `results.json`, and exits non-zero.
+  var
+    failureJson: JsonNode
+    diag = ""
+  let failureKind =
+    case kind
+    of fkModelAction: "player_error"
+    of fkInfra: "episode_inconclusive"
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
     for s in 0 ..< state.awaiting.len:
       state.awaiting[s] = false
-    let cleanMsg = cleanError(message)
-    failureJson = %*{
-      "status": "failed",
-      "reason": "episode_failed",
-      "failure_kind": $kind,
-      "failure_code": code,
-      "message": cleanMsg,
-      "seat": seat,
-      "shift": state.sim.shift + 1,
-      "shifts_completed": state.sim.shift
-    }
-    if seat >= 0 and seat < state.sim.cogs.len:
-      failureJson["alias"] = %Aliases[seat]
+    var cleanMsg = cleanError(message)
+    if cleanMsg.len == 0:
+      cleanMsg = if code.len > 0: code else: "episode failed"
+    if seat >= 0:
+      failureJson = %*{
+        "failed_policy_index": seat,
+        "kind": failureKind,
+        "message": cleanMsg
+      }
+    diag = "episode failed [" & $kind & "/" & code & " -> " & failureKind & "]"
+    if seat >= 0:
+      diag.add(" seat=" & $seat)
+      if seat < state.sim.cogs.len:
+        diag.add(" alias=" & Aliases[seat])
       let names = state.policyNames()
       if seat < names.len and names[seat].len > 0:
-        failureJson["policy"] = %names[seat]
+        diag.add(" policy=" & names[seat])
+    diag.add(" shift=" & $(state.sim.shift + 1) &
+      " shifts_completed=" & $state.sim.shift)
     if rejectedAction.len > 0:
-      failureJson["rejected_action"] = %cleanError(rejectedAction)
+      diag.add(" rejected_action=" & cleanError(rejectedAction))
+    diag.add(": " & cleanMsg)
 
     let errorFrame = %*{
       "type": "error",
@@ -359,10 +370,10 @@ proc failEpisode(
       except CatchableError:
         discard
 
-  log "episode failed [" & $kind & "/" & code & "]: " & cleanError(message)
+  log diag
   sleep(200)
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-  if failureUri.len > 0:
+  if failureUri.len > 0 and not failureJson.isNil:
     try:
       writeArtifact(failureUri, $failureJson, "application/json",
         "COGAME_PLAYER_FAILURE_METHOD")

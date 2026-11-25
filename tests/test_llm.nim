@@ -1,7 +1,7 @@
 ## The decision layer: strict single-object JSON extraction, schema validation,
-## one retry batch, no silent fallback moves, and the ONE PARALLEL BATCH per
-## shift that makes a simultaneous-decision game fit inside its wall-clock
-## budget.
+## no retries or silent fallback moves, actual failing seat attribution, and the
+## ONE PARALLEL BATCH per shift that makes a simultaneous-decision game fit
+## inside its wall-clock budget.
 ##
 ## The stubbed cases are PROCS, not module-level blocks: a `var` in a top-level
 ## block is a GLOBAL in Nim, and a `{.gcsafe.}` transport closure may not touch
@@ -209,7 +209,7 @@ proc scriptedSeatsAreNotBatched() =
     "a seat that REGISTERED as scripted is not a fallback"
   check orders[2].job == jStrip, "and the stripper strips"
 
-proc invalidRepliesRetryOnceThenFail() =
+proc invalidRepliesFailWithoutRetry() =
   var attempts: seq[int]
   proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
     attempts.add(batch.len)
@@ -223,6 +223,7 @@ proc invalidRepliesRetryOnceThenFail() =
   let client = newStubLlmClient(config, stub)
   var raised = false
   var errKind = fkInfra
+  var errSeat = -1
   var errRejected = ""
   try:
     discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
@@ -230,39 +231,74 @@ proc invalidRepliesRetryOnceThenFail() =
   except DecisionError as error:
     raised = true
     errKind = error.kind
+    errSeat = error.seat
     errRejected = error.rejectedAction
   check raised, "invalid replies raise instead of substituting a fallback move"
   check errKind == fkModelAction, "invalid reply is classified as model_invalid_action"
+  check errSeat == 0, "first failing seat is attributed"
   check "decline" in errRejected, "invalid reply records rejectedAction diagnostics"
-  check attempts.len == 2, "one batch plus exactly one retry batch"
-  check attempts[0] == SeatCount and attempts[1] == SeatCount,
-    "the retry carries the seats that failed"
+  check attempts.len == 1, "invalid reply fails immediately without retrying"
+  check attempts[0] == SeatCount, "the single batch carries every open seat"
 
-proc halfValidRepliesRetryOnlyTheFailures() =
-  var second = -1
-  var round = 0
+proc partialFailureAttributesActualSeatWithoutRetry() =
+  var batches = 0
   proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
-    if round == 1:
-      second = batch.len
-    inc round
+    inc batches
     for i in 0 ..< batch.len:
       var response: Response
       response.code = 200
-      ## On the first batch seat 0 answers well and the others do not; on the
-      ## retry everyone answers well.
-      let good = round > 1 or i == 0
+      ## Seat 0 and seat 2 answer well; seat 1 returns invalid text.
       response.body = reply(
-        if good: "{\"job\":\"maintain\"}" else: "not json at all")
+        if i == 1: "not json at all" else: "{\"job\":\"maintain\"}")
       result.add((response, ""))
   let config = baseConfig()
   var sim = initSim(config)
   let client = newStubLlmClient(config, stub)
-  let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-    @[skNone, skNone, skNone], PromptSelection())
-  check second == 2, "the retry batch carries only the two failures, got " & $second
-  check orders[0].source == osLlm, "the seat that answered first time is llm"
-  check orders[1].source == osRetry, "the retried seats are source=retry"
-  check orders[2].source == osRetry, "both of them"
+  var raised = false
+  var errKind = fkInfra
+  var errSeat = -1
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+      @[skNone, skNone, skNone], PromptSelection())
+  except DecisionError as error:
+    raised = true
+    errKind = error.kind
+    errSeat = error.seat
+  check raised, "partial batch failure raises instead of retrying or falling back"
+  check batches == 1, "no retry batch is issued on partial failure"
+  check errKind == fkModelAction, "invalid reply on seat 1 is model_invalid_action"
+  check errSeat == 1, "actual failing seat (1) is attributed, not seat 0"
+
+proc provider503AttributesActualSeatWithoutRetry() =
+  var batches = 0
+  proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
+    inc batches
+    for i in 0 ..< batch.len:
+      var response: Response
+      if i == 2:
+        response.code = 503
+        response.body = "service unavailable"
+      else:
+        response.code = 200
+        response.body = reply("{\"job\":\"operate\"}")
+      result.add((response, ""))
+  let config = baseConfig()
+  var sim = initSim(config)
+  let client = newStubLlmClient(config, stub)
+  var raised = false
+  var errKind = fkModelAction
+  var errSeat = -1
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+      @[skNone, skNone, skNone], PromptSelection())
+  except DecisionError as error:
+    raised = true
+    errKind = error.kind
+    errSeat = error.seat
+  check raised, "HTTP 503 raises instead of retrying or falling back"
+  check batches == 1, "no retry batch is issued on HTTP 503"
+  check errKind == fkInfra, "HTTP 503 is classified as infra"
+  check errSeat == 2, "actual interrupted seat (2) is attributed"
 
 proc transportFailuresRaiseInsteadOfFallback() =
   for mode in ["timeout", "429", "403", "junk", "500", "refusal", "cutoff"]:
@@ -379,11 +415,8 @@ proc aThrottledSeatDoesNotRetrySameShift() =
   except FactoryError:
     raised = true
   check raised, "a throttled seat fails the shift instead of falling back"
-  check sizes.len == 2, "one batch and one retry batch, got " & $sizes.len
-  check sizes[0] == 3, "the first batch carries every open seat"
-  check sizes[1] == 2,
-    "the retry batch carries the two bad replies and NOT the throttled seat, " &
-    "got " & $sizes[1]
+  check sizes.len == 1, "no retry batch is issued, got " & $sizes.len
+  check sizes[0] == 3, "the single batch carries every open seat"
   check not client.disabled, "a 429 does not disable the client"
 
 proc allSeatsThrottledIssueNoRetryBatch() =
@@ -491,8 +524,9 @@ block theEpisodeSETTLESInsideThePlayBudget:
 
 oneBatchCarriesEveryOpenSeat()
 scriptedSeatsAreNotBatched()
-invalidRepliesRetryOnceThenFail()
-halfValidRepliesRetryOnlyTheFailures()
+invalidRepliesFailWithoutRetry()
+partialFailureAttributesActualSeatWithoutRetry()
+provider503AttributesActualSeatWithoutRetry()
 transportFailuresRaiseInsteadOfFallback()
 aRaisingTransportRaisesWithoutRetry()
 aThrottledSeatDoesNotRetrySameShift()
