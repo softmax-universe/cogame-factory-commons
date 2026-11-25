@@ -222,12 +222,18 @@ proc invalidRepliesRetryOnceThenFail() =
   var sim = initSim(config)
   let client = newStubLlmClient(config, stub)
   var raised = false
+  var errKind = fkInfra
+  var errRejected = ""
   try:
     discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
       @[skNone, skNone, skNone], PromptSelection())
-  except FactoryError:
+  except DecisionError as error:
     raised = true
+    errKind = error.kind
+    errRejected = error.rejectedAction
   check raised, "invalid replies raise instead of substituting a fallback move"
+  check errKind == fkModelAction, "invalid reply is classified as model_invalid_action"
+  check "decline" in errRejected, "invalid reply records rejectedAction diagnostics"
   check attempts.len == 2, "one batch plus exactly one retry batch"
   check attempts[0] == SeatCount and attempts[1] == SeatCount,
     "the retry carries the seats that failed"
@@ -292,12 +298,18 @@ proc transportFailuresRaiseInsteadOfFallback() =
     var sim = initSim(config)
     let client = newStubLlmClient(config, stub)
     var raised = false
+    var errKind = fkModelAction
     try:
       discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
         @[skNone, skNone, skNone], PromptSelection())
-    except FactoryError:
+    except DecisionError as error:
       raised = true
+      errKind = error.kind
     check raised, mode & ": raises instead of substituting a fallback move"
+    if mode in ["timeout", "429", "403", "junk", "500"]:
+      check errKind == fkInfra, mode & ": classified as infra failure"
+    else:
+      check errKind == fkModelAction, mode & ": classified as model_invalid_action"
     if mode == "403":
       check client.disabled,
         "a 403 disables the client for the rest of the episode"
@@ -412,12 +424,18 @@ proc disabledClientFailsPromptSeatsAndAllowsScripted() =
   for order in scriptedOrders:
     check order.source == osScripted, "genuine scripted seats stay source=scripted"
   var raised = false
+  var errKind = fkModelAction
+  var errCode = ""
   try:
     discard client.decideAll(sim, @[0, 1, 2], @["a", "", ""],
       @[skNone, skSteward, skStripper], PromptSelection())
-  except FactoryError:
+  except DecisionError as error:
     raised = true
+    errKind = error.kind
+    errCode = error.code
   check raised, "a prompt seat with no credentials raises instead of falling back"
+  check errKind == fkInfra and errCode == "llm_missing_credentials",
+    "missing credentials classified as infra / llm_missing_credentials"
 
 block forfeitProducesValidReplay:
   let config = baseConfig()

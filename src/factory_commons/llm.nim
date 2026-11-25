@@ -9,10 +9,12 @@
 ## Decisions within a shift are SIMULTANEOUS by rule, so all open prompt seats
 ## go out as ONE parallel batch (`curly.makeRequests`); invalid replies are
 ## retried once as a smaller batch with a hint, and any seat still failing
-## raises `FactoryError` so the server forfeits the episode rather than silently
-## substituting a scripted move. Deciding in the GAME container is what makes
-## one parallel batch per turn possible, and is why the coworld secret must be
-## on the game runnable (hive, 2026-08-23).
+## raises `DecisionError` (distinguishing infrastructure/provider failures from
+## model-generated invalid replies) so the server terminates the unfinished
+## episode unscored with failure diagnostics rather than silently substituting
+## a scripted move or inventing a forfeit score. Deciding in the GAME container
+## is what makes one parallel batch per turn possible, and is why the coworld
+## secret must be on the game runnable (hive, 2026-08-23).
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -35,10 +37,22 @@ const
   BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type
-  ThrottledError* = object of FactoryError
+  FailureKind* = enum
+    fkInfra = "infra"
+    fkModelAction = "model_invalid_action"
+
+  DecisionError* = object of FactoryError
+    ## Structured decision failure separating infrastructure/provider errors
+    ## from model-generated unparseable or illegal actions.
+    kind*: FailureKind
+    code*: string
+    seat*: int
+    rejectedAction*: string
+
+  ThrottledError* = object of DecisionError
     ## A 429 from the API. Distinct from every other transport failure because
-    ## the design note answers it differently: the seat is retried in the NEXT
-    ## shift's batch, not in this shift's retry batch.
+    ## the design note answers it differently: the seat is not retried inside
+    ## the same shift's retry batch.
 
   LlmTransport* = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -61,9 +75,22 @@ type
     maxOutputTokens*: int
     timeoutSeconds*: int
     disabled*: bool             ## true once credentials are known-unavailable
+    disabledCode*: string       ## infra code explaining why client is disabled
     lastBatchSize*: int         ## requests in the most recent batch
     batches*: int               ## batches issued this episode
     stub*: TransportStub
+
+proc newDecisionError*(
+  kind: FailureKind,
+  code, message: string,
+  seat = -1,
+  rejectedAction = ""
+): ref DecisionError =
+  result = newException(DecisionError, message)
+  result.kind = kind
+  result.code = code
+  result.seat = seat
+  result.rejectedAction = rejectedAction
 
 proc cleanText*(text: string, limit: int): string =
   ## Text over the cap is cut at a RUNE boundary with the cut marked.
@@ -152,6 +179,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
+    result.disabledCode = "llm_missing_credentials"
     log "llm: no LLM credentials; prompt seats require credentials"
 
 proc newStubLlmClient*(config: GameConfig, stub: TransportStub): LlmClient =
@@ -684,34 +712,53 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
-proc textOf(client: LlmClient, response: Response, error, url: string): string =
-  ## The text of one batched reply, or a FactoryError describing why there is
+proc textOf(client: LlmClient, response: Response, error, url: string,
+    seat = -1): string =
+  ## The text of one batched reply, or a DecisionError describing why there is
   ## none. Auth failures disable the client for the rest of the episode; a 429
-  ## is logged and that seat is retried in the next shift's batch.
+  ## raises ThrottledError (infra) so it is not retried inside the same shift.
   if error.len > 0:
-    raise newException(FactoryError, "llm transport: " & cleanError(error))
+    raise newDecisionError(fkInfra, "llm_transport_error",
+      "llm transport: " & cleanError(error), seat)
   if response.code == 401 or response.code == 403:
     client.disabled = true
-    raise newException(FactoryError, "llm auth failed (" & $response.code &
-      ") at " & url & ": " & cleanError(response.body))
+    client.disabledCode = "llm_auth_error"
+    raise newDecisionError(fkInfra, "llm_auth_error",
+      "llm auth failed (" & $response.code & ") at " & url & ": " &
+      cleanError(response.body), seat)
   if response.code == 429:
-    raise newException(ThrottledError, "llm throttled (429): " &
-      cleanError(response.body))
+    var throttled = newException(ThrottledError,
+      "llm throttled (429): " & cleanError(response.body))
+    throttled.kind = fkInfra
+    throttled.code = "llm_throttled"
+    throttled.seat = seat
+    raise throttled
   if response.code < 200 or response.code >= 300:
-    raise newException(FactoryError, "llm error " & $response.code & ": " &
-      cleanError(response.body))
-  let payload = parseJson(response.body)
+    raise newDecisionError(fkInfra, "llm_provider_error",
+      "llm error " & $response.code & ": " & cleanError(response.body), seat)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raise newDecisionError(fkInfra, "llm_provider_error",
+      "llm provider returned non-JSON body: " & cleanError(parseErr.msg), seat)
+  if payload.isNil or payload.kind != JObject:
+    raise newDecisionError(fkInfra, "llm_provider_error",
+      "llm provider returned non-object JSON body", seat)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(FactoryError, "llm refusal")
+    raise newDecisionError(fkModelAction, "llm_refusal",
+      "llm refusal", seat, cleanError(response.body))
   let content = payload{"content"}
   if content.isNil or content.kind != JArray:
-    raise newException(FactoryError, "llm reply carried no content array")
+    raise newDecisionError(fkInfra, "llm_provider_error",
+      "llm reply carried no content array", seat)
   for contentBlock in content:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(FactoryError,
-      "reply cut off at max_tokens before any JSON: " & cleanError(result))
+    raise newDecisionError(fkModelAction, "llm_invalid_reply",
+      "reply cut off at max_tokens before any JSON: " & cleanError(result),
+      seat, cleanError(result))
 
 proc parseOrder*(payload: JsonNode): Order =
   ## The reply schema. `job` missing or outside its enum is an INVALID REPLY;
@@ -814,13 +861,18 @@ proc decideAll*(
   ## One order per seat in `seats`, in order. Genuine scripted seats run their
   ## baseline deterministically; prompt seats go out in ONE parallel batch with
   ## at most one retry batch for invalid replies. Never silently substitutes a
-  ## scripted fallback move — raises `FactoryError` if any prompt seat fails.
+  ## scripted fallback move — raises `DecisionError` if any prompt seat fails,
+  ## preserving whether the cause was infrastructure/provider or a model-
+  ## generated unparseable/invalid action.
   ## `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[Order](seats.len)
   var
     open: seq[int]
     failed: seq[int]
     lastErrors = newSeq[string](seats.len)
+    lastKinds = newSeq[FailureKind](seats.len)
+    lastCodes = newSeq[string](seats.len)
+    lastRejected = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone:
@@ -828,8 +880,11 @@ proc decideAll*(
       ## `source: "scripted"`.
       result[index] = sim.scriptedOrder(seat, kind)
     elif client.disabled:
-      raise newException(FactoryError,
-        "llm disabled for seat " & $seat & " (no usable LLM credentials)")
+      let code =
+        if client.disabledCode.len > 0: client.disabledCode
+        else: "llm_missing_credentials"
+      raise newDecisionError(fkInfra, code,
+        "llm disabled for seat " & $seat & " (" & code & ")", seat)
     else:
       open.add(index)
 
@@ -857,29 +912,58 @@ proc decideAll*(
       log msg
       for index in open:
         lastErrors[index] = msg
+        lastKinds[index] = fkInfra
+        lastCodes[index] = "llm_transport_error"
+        lastRejected[index] = ""
       break
     var stillOpen: seq[int]
     for position, index in open:
       let seat = seats[index]
       if position >= responses.len:
         lastErrors[index] = "missing response from LLM batch"
+        lastKinds[index] = fkInfra
+        lastCodes[index] = "llm_transport_error"
+        lastRejected[index] = ""
         stillOpen.add(index)
         continue
+      var replyText = ""
       try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        var order = parseOrder(extractJsonObject(text))
+        replyText = client.textOf(responses[position].response,
+          responses[position].error, batch[position].url, seat)
+        var order = parseOrder(extractJsonObject(replyText))
         order.source = if attempt == 0: osLlm else: osRetry
         result[index] = order
       except ThrottledError as error:
         let msg = cleanError(error.msg)
         log "llm: seat " & $seat & " throttled: " & msg
         lastErrors[index] = msg
+        lastKinds[index] = fkInfra
+        lastCodes[index] = "llm_throttled"
+        lastRejected[index] = ""
         failed.add(index)
+      except DecisionError as error:
+        let msg = cleanError(error.msg)
+        log "llm: seat " & $seat & " attempt " & $attempt & " failed: " & msg
+        lastErrors[index] = msg
+        lastKinds[index] = error.kind
+        lastCodes[index] = error.code
+        lastRejected[index] = error.rejectedAction
+        stillOpen.add(index)
+      except FactoryError as error:
+        let msg = cleanError(error.msg)
+        log "llm: seat " & $seat & " attempt " & $attempt & " invalid reply: " & msg
+        lastErrors[index] = msg
+        lastKinds[index] = fkModelAction
+        lastCodes[index] = "llm_invalid_reply"
+        lastRejected[index] = cleanError(replyText)
+        stillOpen.add(index)
       except CatchableError as error:
         let msg = cleanError(error.msg)
         log "llm: seat " & $seat & " attempt " & $attempt & " failed: " & msg
         lastErrors[index] = msg
+        lastKinds[index] = fkInfra
+        lastCodes[index] = "llm_provider_error"
+        lastRejected[index] = ""
         stillOpen.add(index)
     open = stillOpen
 
@@ -891,5 +975,9 @@ proc decideAll*(
     let reason =
       if lastErrors[first].len > 0: lastErrors[first]
       else: "no valid order returned"
-    raise newException(FactoryError,
-      "llm decision failed for seat " & $seat & ": " & reason)
+    let code =
+      if lastCodes[first].len > 0: lastCodes[first]
+      else: "llm_error"
+    raise newDecisionError(lastKinds[first], code,
+      "llm decision failed for seat " & $seat & ": " & reason,
+      seat, lastRejected[first])

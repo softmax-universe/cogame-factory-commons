@@ -89,6 +89,7 @@ type
     awaiting: seq[bool]
     actions: seq[JsonNode]
     rejected: seq[string]
+    rejectedRaw: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -293,15 +294,83 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   log "episode complete, shutting down"
   quit(0)
 
+proc failEpisode(
+  runtimeConfig: RuntimeConfig,
+  kind: FailureKind,
+  code, message: string,
+  seat = -1,
+  rejectedAction = ""
+) =
+  ## Explicit failure lifecycle for unfinished/failed episodes (infrastructure,
+  ## credential, transport, timeout, disconnect, or model-generated illegal/
+  ## unparseable action). Never invents a forfeit, authoritative gameplay scores,
+  ## or winners: writes structured failure diagnostics to
+  ## `COGAME_PLAYER_FAILURE_URI` (when configured), notifies connected players,
+  ## omits `results.json`, and exits non-zero.
+  var failureJson: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    for s in 0 ..< state.awaiting.len:
+      state.awaiting[s] = false
+    let cleanMsg = cleanError(message)
+    failureJson = %*{
+      "status": "failed",
+      "reason": "episode_failed",
+      "failure_kind": $kind,
+      "failure_code": code,
+      "message": cleanMsg,
+      "seat": seat,
+      "shift": state.sim.shift + 1,
+      "shifts_completed": state.sim.shift
+    }
+    if seat >= 0 and seat < state.sim.cogs.len:
+      failureJson["alias"] = %Aliases[seat]
+      let names = state.policyNames()
+      if seat < names.len and names[seat].len > 0:
+        failureJson["policy"] = %names[seat]
+    if rejectedAction.len > 0:
+      failureJson["rejected_action"] = %cleanError(rejectedAction)
+
+    let errorFrame = %*{
+      "type": "error",
+      "done": true,
+      "failure_kind": $kind,
+      "failure_code": code,
+      "message": cleanMsg,
+      "seat": seat
+    }
+    for _, socket in state.playerSockets:
+      try:
+        socket.send($errorFrame)
+      except CatchableError:
+        discard
+
+  log "episode failed [" & $kind & "/" & code & "]: " & cleanError(message)
+  sleep(200)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(failureUri, $failureJson, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD")
+      log "player failure diagnostics written"
+    except CatchableError as error:
+      log "failed to write COGAME_PLAYER_FAILURE_URI: " & cleanError(error.msg)
+  quit(1)
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let
       config = state.config
       gameStart = epochTime()
       connectDeadline = gameStart + config.playerConnectTimeoutSeconds.float
-    var allReady = false
+    var
+      anyConnected = false
+      allReady = false
     while epochTime() < connectDeadline:
       withLock stateLock:
+        anyConnected = anyConnected or state.playerSockets.len > 0
         allReady = state.playerSockets.len >= config.numAgents
         if allReady:
           for seat in 0 ..< config.numAgents:
@@ -312,27 +381,44 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(50)
 
+    var missingSeat = -1
     withLock stateLock:
       state.started = true
+      anyConnected = anyConnected or state.playerSockets.len > 0
       allReady = state.playerSockets.len >= config.numAgents
       if allReady:
         for seat in 0 ..< config.numAgents:
           if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
             allReady = false
+            missingSeat = seat
+            break
+      else:
+        for seat in 0 ..< config.numAgents:
+          if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
+            missingSeat = seat
             break
       log "starting with " & $state.playerSockets.len & "/" &
         $config.numAgents & " seats connected"
       state.broadcastLocked()
 
-    if not allReady:
-      ## At least one seat failed to connect and register inside the connect
-      ## timeout. Forfeit cleanly — never substitute a scripted seat.
-      log "not all seats connected and registered within " &
+    if not anyConnected:
+      ## Pre-existing rule (`docs/plans/2026-08-25-factory-commons-design.md:348`,
+      ## `coworld_manifest_template.json:464`): ONLY when no seat connected
+      ## within `playerConnectTimeoutSeconds = 180` is the episode forfeited.
+      log "no seat connected within " &
         $config.playerConnectTimeoutSeconds & "s; forfeiting"
       withLock stateLock:
         state.sim.forfeit()
         state.broadcastLocked()
       finishEpisode(runtimeConfig)
+      return
+
+    if not allReady:
+      ## Partial connect/registration timeout is an infrastructure/startup
+      ## failure, never an invented forfeit or silent scripted substitution.
+      failEpisode(runtimeConfig, fkInfra, "seat_connect_timeout",
+        "seat " & $missingSeat & " did not connect and register within " &
+        $config.playerConnectTimeoutSeconds & "s", missingSeat)
       return
 
     let client = newLlmClient(config)
@@ -386,9 +472,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             break
           seats.add(seat)
         if disconnectedSeat >= 0:
-          log "seat " & $disconnectedSeat & " disconnected; forfeiting"
-          state.sim.forfeit()
-          state.broadcastLocked()
           break
         simCopy = state.sim
         prompts = state.prompts
@@ -397,10 +480,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         log "shift " & $(state.sim.shift + 1) & " of " & $config.shifts &
           " at " & $(epochTime() - gameStart).int & "s"
 
+      if disconnectedSeat >= 0:
+        failEpisode(runtimeConfig, fkInfra, "seat_disconnected",
+          "seat " & $disconnectedSeat & " disconnected before shift " &
+          $(simCopy.shift + 1), disconnectedSeat)
+        return
+
       var hasExternal = false
       withLock stateLock:
         for seat in seats:
           state.rejected[seat] = ""
+          state.rejectedRaw[seat] = ""
           if external[seat]:
             hasExternal = true
             state.awaiting[seat] = true
@@ -422,25 +512,37 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## snapshot cannot go stale.
       let batchStart = epochTime()
       var orders = newSeq[Order](seats.len)
-      var decisionError = ""
+      var
+        hasDecisionError = false
+        decisionKind = fkInfra
+        decisionCode = ""
+        decisionError = ""
+        decisionSeat = -1
+        decisionRejected = ""
       if managedSeats.len > 0:
         try:
           let managedOrders = client.decideAll(
             simCopy, managedSeats, prompts, scripted, state.selection)
           for i, seat in managedSeats:
             orders[seat] = managedOrders[i]
+        except DecisionError as error:
+          hasDecisionError = true
+          decisionKind = error.kind
+          decisionCode = error.code
+          decisionError = cleanError(error.msg)
+          decisionSeat = error.seat
+          decisionRejected = error.rejectedAction
         except CatchableError as error:
+          hasDecisionError = true
+          decisionKind = fkInfra
+          decisionCode = "llm_error"
           decisionError = cleanError(error.msg)
       let batchSeconds = epochTime() - batchStart
 
-      if decisionError.len > 0:
-        log "decision failed (" & decisionError & "); forfeiting"
-        withLock stateLock:
-          for seat in seats:
-            state.awaiting[seat] = false
-          state.sim.forfeit()
-          state.broadcastLocked()
-        break
+      if hasDecisionError:
+        failEpisode(runtimeConfig, decisionKind, decisionCode, decisionError,
+          decisionSeat, decisionRejected)
+        return
 
       if hasExternal:
         let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
@@ -462,35 +564,56 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             break
           sleep(20)
 
-      var forfeitReason = ""
+      var
+        hasExtFailure = false
+        extKind = fkInfra
+        extCode = ""
+        extMessage = ""
+        extSeat = -1
+        extRejected = ""
       withLock stateLock:
         for index, seat in seats:
           if not state.playerSockets.hasKey(seat):
-            forfeitReason = "seat " & $seat & " disconnected"
+            hasExtFailure = true
+            extKind = fkInfra
+            extCode = "seat_disconnected"
+            extMessage = "seat " & $seat & " disconnected"
+            extSeat = seat
             break
           if external[seat]:
             state.awaiting[seat] = false
             if state.rejected[seat].len > 0:
-              forfeitReason = "seat " & $seat & " rejected action: " &
+              hasExtFailure = true
+              extKind = fkModelAction
+              extCode = "external_action_rejected"
+              extMessage = "seat " & $seat & " rejected action: " &
                 state.rejected[seat]
+              extSeat = seat
+              extRejected = state.rejectedRaw[seat]
               break
             if state.actions[seat].isNil:
-              forfeitReason = "seat " & $seat & " missed action deadline"
+              hasExtFailure = true
+              extKind = fkInfra
+              extCode = "external_action_timeout"
+              extMessage = "seat " & $seat & " missed action deadline"
+              extSeat = seat
               break
             try:
               orders[index] = parseOrder(state.actions[seat])
               orders[index].source = osLlm
             except CatchableError as error:
-              forfeitReason = "seat " & $seat & " invalid action: " &
+              hasExtFailure = true
+              extKind = fkModelAction
+              extCode = "external_action_rejected"
+              extMessage = "seat " & $seat & " invalid action: " &
                 cleanError(error.msg)
+              extSeat = seat
+              extRejected = cleanError($state.actions[seat])
               break
-        if forfeitReason.len > 0:
-          for seat in seats:
-            state.awaiting[seat] = false
-          log forfeitReason & "; forfeiting"
-          state.sim.forfeit()
-          state.broadcastLocked()
-          break
+      if hasExtFailure:
+        failEpisode(runtimeConfig, extKind, extCode, extMessage, extSeat,
+          extRejected)
+        return
 
       withLock stateLock:
         for index, seat in seats:
@@ -691,6 +814,7 @@ proc websocketHandler(
           if state.external[slot] and state.awaiting[slot] and
               state.rejected[slot].len == 0:
             state.rejected[slot] = reason
+            state.rejectedRaw[slot] = cleanError(message.data)
         log "rejected player frame from seat " & $slot & ": " & reason
     of ErrorEvent:
       discard
@@ -730,6 +854,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.awaiting = newSeq[bool](config.numAgents)
   state.actions = newSeq[JsonNode](config.numAgents)
   state.rejected = newSeq[string](config.numAgents)
+  state.rejectedRaw = newSeq[string](config.numAgents)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter()

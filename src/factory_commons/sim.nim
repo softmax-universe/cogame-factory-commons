@@ -310,8 +310,9 @@ proc endEarly*(sim: var Sim) =
   sim.finish("deadline", "deadline")
 
 proc forfeit*(sim: var Sim) =
-  ## Episode forfeited (missing/disconnected seat, rejected reply, or missed
-  ## deadline). Results AND the replay are still written.
+  ## Pre-existing rule (`docs/plans/2026-08-25-factory-commons-design.md:348`,
+  ## `coworld_manifest_template.json:464`): ONLY when no seat connected within
+  ## `playerConnectTimeoutSeconds = 180`. Results AND the replay are written.
   if sim.frames.len == 0:
     sim.captureFrame()
   sim.finish("forfeit", "forfeit")
