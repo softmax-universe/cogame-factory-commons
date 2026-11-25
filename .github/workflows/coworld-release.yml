@@ -32,7 +32,8 @@ jobs:
                   for v in x:pin(v)
           pin(d);Path('release-template.json').write_text(json.dumps(d))
           PYTHON
-          uvx --from 'coworld[auth]==0.1.64' coworld build --project . --version 0.1.7 --template release-template.json
+          sed '/^[[:space:]]*network: host[[:space:]]*$/d' compose.yaml > release-compose.yaml
+          uvx --from 'coworld[auth]==0.1.64' coworld build --project . --compose release-compose.yaml --version 0.1.7 --template release-template.json
           mkdir -p "$RUNNER_TEMP/native-candidate"
           cp -a dist "$RUNNER_TEMP/native-candidate/"
           python3 - <<'PYTHON'
