@@ -20,7 +20,10 @@
       "run": [
         "/bin/factory-commons"
       ],
-      "env": {},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "source_url": "https://github.com/softmax-universe/cogame-factory-commons/tree/main"
     },
     "replay_viewer": {
@@ -496,7 +499,8 @@
         "/bin/factory-commons-player"
       ],
       "env": {
-        "COWORLD_LLM_ENABLED": "true"
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
       }
     },
     {
@@ -652,7 +656,7 @@
     },
     "players": [
       {
-        "player_id": "factory-commons-steward"
+        "player_id": "factory-commons-player"
       },
       {
         "player_id": "factory-commons-steward"

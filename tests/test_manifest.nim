@@ -126,7 +126,14 @@ block uploadContract:
 block hostedLlmNeedsNoSecret:
   let name = manifest["game"]["name"].getStr()
   check name == GameName, "game.name is " & GameName
-  doAssert manifest{"game"}{"runnable"}{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
+  let gameEnv = manifest{"game"}{"runnable"}{"env"}
+  check not gameEnv.isNil and gameEnv.kind == JObject,
+    "game.runnable.env is an object"
+  check gameEnv{"COWORLD_LLM_ENABLED"}.getStr() == "true",
+    "game.runnable.env sets COWORLD_LLM_ENABLED=true for server-side inference"
+  check gameEnv{"COWORLD_LLM_MODEL"}.getStr() == "anthropic/claude-haiku-4.5",
+    "game.runnable.env sets default COWORLD_LLM_MODEL"
+  doAssert gameEnv{"ANTHROPIC_API_KEY_URI"}.isNil,
     "hosted LLM uses the platform sidecar without provider secrets"
 
 block docsAndProtocols:
@@ -228,7 +235,6 @@ block configSchemaIsRealJsonSchema:
 
 block playersAndCertificationAgree:
   var declared: HashSet[string]
-  var byId = newJObject()
   for entry in manifest["player"]:
     check entry.hasKey("id") and entry.hasKey("type") and
       entry.hasKey("name") and entry.hasKey("description"),
@@ -238,12 +244,11 @@ block playersAndCertificationAgree:
       "every player entry runs the player binary"
     let id = entry["id"].getStr()
     declared.incl(id)
-    byId[id] = entry
   check declared.len == SeatCount,
     "three player entries: native model player plus two scripted baselines"
 
   ## First player runnable must be the native model player with explicit
-  ## COWORLD_LLM_ENABLED=true and no PLAYER_SCRIPTED env.
+  ## COWORLD_LLM_ENABLED=true, default COWORLD_LLM_MODEL, and no PLAYER_SCRIPTED env.
   let first = manifest["player"][0]
   check first["id"].getStr() == "factory-commons-player",
     "first player entry is the native model player factory-commons-player"
@@ -252,6 +257,8 @@ block playersAndCertificationAgree:
     "native model player declares an env object"
   check firstEnv{"COWORLD_LLM_ENABLED"}.getStr() == "true",
     "native model player sets COWORLD_LLM_ENABLED=true"
+  check firstEnv{"COWORLD_LLM_MODEL"}.getStr() == "anthropic/claude-haiku-4.5",
+    "native model player sets default COWORLD_LLM_MODEL"
   check not firstEnv.hasKey("PLAYER_SCRIPTED"),
     "native model player must not set PLAYER_SCRIPTED"
 
@@ -271,17 +278,22 @@ block playersAndCertificationAgree:
       inc modelPlayers
       check not env.isNil and env{"COWORLD_LLM_ENABLED"}.getStr() == "true",
         "non-scripted player sets COWORLD_LLM_ENABLED=true"
+      check env{"COWORLD_LLM_MODEL"}.getStr().len > 0,
+        "non-scripted player sets default COWORLD_LLM_MODEL"
   check modelPlayers == 1, "one native model player entry"
   check scripted == 2, "and two explicit scripted baselines"
 
-  ## Certification seats must select explicit declared scripted player IDs so
-  ## deterministic offline certification never depends on model fallbacks.
+  ## Certification fixture must seat every declared player ID (including the
+  ## native model player) so the official certifier's players-run check passes.
+  var seated: HashSet[string]
   for slot in manifest["certification"]["players"]:
     let id = slot["player_id"].getStr()
     check id in declared, "certification player " & id & " is declared"
-    let env = byId[id]{"env"}
-    check not env.isNil and env.hasKey("PLAYER_SCRIPTED"),
-      "certification seat " & id & " is an explicit scripted baseline"
+    seated.incl(id)
+  check seated == declared,
+    "certification.players seats every declared player ID"
+  check "factory-commons-player" in seated,
+    "certification.players seats the native model player"
 
 block resultsSchemaMatchesTheSim:
   let schema = manifest["game"]["results_schema"]
