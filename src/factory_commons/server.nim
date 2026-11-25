@@ -85,8 +85,12 @@ type
     prompts: seq[string]
     scripted: seq[ScriptKind]
     external: seq[bool]
+    registered: seq[bool]
+    disconnected: seq[bool]
     awaiting: seq[bool]
     actions: seq[JsonNode]
+    rejected: seq[string]
+    rejectedRaw: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -217,10 +221,18 @@ proc broadcastLocked(gs: var GameState) =
       socket.send(blobFromBytes(chunk), BinaryMessage)
   lastBroadcastTick = max(0, gs.sim.tick - 1)
 
-proc sendPlayerStates(gs: GameState) =
+proc sendPlayerStates(gs: var GameState) =
+  var deadSlots: seq[int]
   for slot, socket in gs.playerSockets:
     if slot < gs.sim.cogs.len:
-      socket.send($gs.sim.observationJson(slot))
+      try:
+        socket.send($gs.sim.observationJson(slot))
+      except CatchableError:
+        deadSlots.add(slot)
+  for slot in deadSlots:
+    gs.playerSockets.del(slot)
+    if gs.started and not gs.finished and slot >= 0 and slot < gs.disconnected.len:
+      gs.disconnected[slot] = true
 
 proc writeArtifact(uri, data, contentType, methodEnv: string) =
   ## Writes a Coworld artifact, honouring the platform's PUT/POST method hint.
@@ -274,7 +286,10 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.sendPlayerStates()
     for slot, socket in state.playerSockets:
       final["slot"] = %slot
-      socket.send($final)
+      try:
+        socket.send($final)
+      except CatchableError:
+        discard
     state.broadcastLocked()
 
   sleep(500)
@@ -291,38 +306,125 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   log "episode complete, shutting down"
   quit(0)
 
+proc failEpisode(
+  runtimeConfig: RuntimeConfig,
+  kind: FailureKind,
+  code, message: string,
+  seat = -1,
+  rejectedAction = ""
+) =
+  ## Explicit failure lifecycle for unfinished/failed episodes (infrastructure,
+  ## credential, transport, timeout, disconnect, or model-generated illegal/
+  ## unparseable action). Never invents a forfeit, authoritative gameplay scores,
+  ## or winners: writes structured failure diagnostics to
+  ## `COGAME_PLAYER_FAILURE_URI` (when configured), notifies connected players,
+  ## omits `results.json`, and exits non-zero.
+  var failureJson: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    for s in 0 ..< state.awaiting.len:
+      state.awaiting[s] = false
+    let cleanMsg = cleanError(message)
+    failureJson = %*{
+      "status": "failed",
+      "reason": "episode_failed",
+      "failure_kind": $kind,
+      "failure_code": code,
+      "message": cleanMsg,
+      "seat": seat,
+      "shift": state.sim.shift + 1,
+      "shifts_completed": state.sim.shift
+    }
+    if seat >= 0 and seat < state.sim.cogs.len:
+      failureJson["alias"] = %Aliases[seat]
+      let names = state.policyNames()
+      if seat < names.len and names[seat].len > 0:
+        failureJson["policy"] = %names[seat]
+    if rejectedAction.len > 0:
+      failureJson["rejected_action"] = %cleanError(rejectedAction)
+
+    let errorFrame = %*{
+      "type": "error",
+      "done": true,
+      "failure_kind": $kind,
+      "failure_code": code,
+      "message": cleanMsg,
+      "seat": seat
+    }
+    for _, socket in state.playerSockets:
+      try:
+        socket.send($errorFrame)
+      except CatchableError:
+        discard
+
+  log "episode failed [" & $kind & "/" & code & "]: " & cleanError(message)
+  sleep(200)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(failureUri, $failureJson, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD")
+      log "player failure diagnostics written"
+    except CatchableError as error:
+      log "failed to write COGAME_PLAYER_FAILURE_URI: " & cleanError(error.msg)
+  quit(1)
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let
       config = state.config
       gameStart = epochTime()
       connectDeadline = gameStart + config.playerConnectTimeoutSeconds.float
-    var anyConnected = false
+    var allReady = false
     while epochTime() < connectDeadline:
-      var allConnected = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.numAgents
-        anyConnected = anyConnected or state.playerSockets.len > 0
-      if allConnected:
+        allReady = state.playerSockets.len >= config.numAgents
+        if allReady:
+          for seat in 0 ..< config.numAgents:
+            if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(50)
 
+    var
+      missingSeat = -1
+      connectedCount = 0
     withLock stateLock:
       state.started = true
-      anyConnected = anyConnected or state.playerSockets.len > 0
-      log "starting with " & $state.playerSockets.len & "/" &
+      connectedCount = state.playerSockets.len
+      allReady = connectedCount >= config.numAgents
+      if allReady:
+        for seat in 0 ..< config.numAgents:
+          if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
+            allReady = false
+            missingSeat = seat
+            break
+      else:
+        for seat in 0 ..< config.numAgents:
+          if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
+            missingSeat = seat
+            break
+      log "starting with " & $connectedCount & "/" &
         $config.numAgents & " seats connected"
       state.broadcastLocked()
 
-    if not anyConnected:
-      ## Nobody arrived inside the connect timeout. Results AND the replay are
-      ## still written, every score zero, so the episode is a record rather
-      ## than a hole.
-      log "no seat connected within " &
-        $config.playerConnectTimeoutSeconds & "s; forfeiting"
-      withLock stateLock:
-        state.sim.forfeit()
-      finishEpisode(runtimeConfig)
+    if not allReady:
+      ## Missing or unregistered seats (whether zero or partial) are an
+      ## infrastructure/startup failure, never an invented forfeit or silent
+      ## scripted substitution.
+      let msg =
+        if connectedCount == 0:
+          "no seats connected and registered within " &
+          $config.playerConnectTimeoutSeconds & "s"
+        else:
+          "seat " & $missingSeat & " did not connect and register within " &
+          $config.playerConnectTimeoutSeconds & "s"
+      failEpisode(runtimeConfig, fkInfra, "seat_connect_timeout", msg,
+        if connectedCount == 0: -1 else: missingSeat)
       return
 
     let client = newLlmClient(config)
@@ -358,95 +460,198 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         prompts: seq[string]
         scripted: seq[ScriptKind]
         external: seq[bool]
+        disconnectedSeat = -1
+        disconnectedShift = 0
+        deadlineBeforeFirstShift = false
       withLock stateLock:
         if state.sim.done:
           break
         if not config.shiftFitsBeforeDeadline(epochTime(), playDeadline):
-          log "play deadline reached after " & $state.sim.shift & "/" &
-            $config.shifts & " shifts (a shift needs " &
-            $config.shiftBudgetSeconds() & "s and settling " &
-            $config.settleBudgetSeconds() & "s); ending early"
-          state.sim.endEarly()
-          state.broadcastLocked()
-          break
-        for seat in 0 ..< state.sim.cogs.len:
-          seats.add(seat)
-        simCopy = state.sim
-        prompts = state.prompts
-        scripted = state.scripted
-        external = state.external
-        ## A seat that never connected, or whose socket died, plays the steward
-        ## for every remaining shift — the episode never blocks on a socket.
-        for seat in seats:
-          if not state.playerSockets.hasKey(seat) and
-              scripted[seat] == skNone:
-            scripted[seat] = skSteward
-        log "shift " & $(state.sim.shift + 1) & " of " & $config.shifts &
-          " at " & $(epochTime() - gameStart).int & "s"
+          if state.sim.shift == 0:
+            deadlineBeforeFirstShift = true
+          else:
+            log "play deadline reached after " & $state.sim.shift & "/" &
+              $config.shifts & " shifts (a shift needs " &
+              $config.shiftBudgetSeconds() & "s and settling " &
+              $config.settleBudgetSeconds() & "s); ending early"
+            state.sim.endEarly()
+            state.broadcastLocked()
+            break
+        if not deadlineBeforeFirstShift:
+          for seat in 0 ..< state.sim.cogs.len:
+            if state.disconnected[seat] or not state.playerSockets.hasKey(seat):
+              disconnectedSeat = seat
+              disconnectedShift = state.sim.shift + 1
+              break
+            seats.add(seat)
+          if disconnectedSeat < 0:
+            simCopy = state.sim
+            prompts = state.prompts
+            scripted = state.scripted
+            external = state.external
+            log "shift " & $(state.sim.shift + 1) & " of " & $config.shifts &
+              " at " & $(epochTime() - gameStart).int & "s"
 
+      if deadlineBeforeFirstShift:
+        failEpisode(runtimeConfig, fkInfra, "play_deadline_before_first_shift",
+          "play deadline reached before shift 1 could start")
+        return
+
+      if disconnectedSeat >= 0:
+        failEpisode(runtimeConfig, fkInfra, "seat_disconnected",
+          "seat " & $disconnectedSeat & " disconnected before shift " &
+          $disconnectedShift, disconnectedSeat)
+        return
+
+      var hasExternal = false
       withLock stateLock:
         for seat in seats:
+          state.rejected[seat] = ""
+          state.rejectedRaw[seat] = ""
           if external[seat]:
+            hasExternal = true
             state.awaiting[seat] = true
             state.actions[seat] = nil
             if state.playerSockets.hasKey(seat):
-              state.playerSockets[seat].send($ %*{
-                "type": "observation",
-                "shift": simCopy.shift,
-                "observation": simCopy.observationJson(seat)
-              })
+              try:
+                state.playerSockets[seat].send($ %*{
+                  "type": "observation",
+                  "shift": simCopy.shift,
+                  "observation": simCopy.observationJson(seat)
+                })
+              except CatchableError:
+                state.playerSockets.del(seat)
+                state.disconnected[seat] = true
 
+      var managedSeats: seq[int]
       for seat in seats:
-        if external[seat]:
-          scripted[seat] = skSteward
+        if not external[seat]:
+          managedSeats.add(seat)
 
-      ## The slow part (Claude, ONE parallel batch for legacy prompts) runs
-      ## outside the lock on a snapshot; only this thread mutates the sim, so
-      ## the snapshot cannot go stale.
+      ## The slow part (LLM, ONE parallel batch for prompt seats) runs outside
+      ## the lock on a snapshot; only this thread mutates the sim, so the
+      ## snapshot cannot go stale.
       let batchStart = epochTime()
-      var orders = client.decideAll(simCopy, seats, prompts, scripted, state.selection)
+      var orders = newSeq[Order](seats.len)
+      var
+        hasDecisionError = false
+        decisionKind = fkInfra
+        decisionCode = ""
+        decisionError = ""
+        decisionSeat = -1
+        decisionRejected = ""
+      if managedSeats.len > 0:
+        try:
+          let managedOrders = client.decideAll(
+            simCopy, managedSeats, prompts, scripted, state.selection)
+          for i, seat in managedSeats:
+            orders[seat] = managedOrders[i]
+        except DecisionError as error:
+          hasDecisionError = true
+          decisionKind = error.kind
+          decisionCode = error.code
+          decisionError = cleanError(error.msg)
+          decisionSeat = error.seat
+          decisionRejected = error.rejectedAction
+        except CatchableError as error:
+          hasDecisionError = true
+          decisionKind = fkInfra
+          decisionCode = "llm_error"
+          decisionError = cleanError(error.msg)
       let batchSeconds = epochTime() - batchStart
 
-      let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
-      while epochTime() < actionDeadline:
-        var waiting = false
-        withLock stateLock:
-          for seat in seats:
-            if external[seat] and state.actions[seat].isNil:
-              waiting = true
-        if not waiting:
-          break
-        sleep(20)
+      if hasDecisionError:
+        failEpisode(runtimeConfig, decisionKind, decisionCode, decisionError,
+          decisionSeat, decisionRejected)
+        return
 
+      if hasExternal:
+        let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
+        while epochTime() < actionDeadline:
+          var waiting = false
+          var failed = false
+          withLock stateLock:
+            for seat in seats:
+              if state.disconnected[seat] or not state.playerSockets.hasKey(seat):
+                failed = true
+                break
+              if external[seat]:
+                if state.rejected[seat].len > 0:
+                  failed = true
+                  break
+                if state.actions[seat].isNil:
+                  waiting = true
+          if failed or not waiting:
+            break
+          sleep(20)
+
+      var
+        hasExtFailure = false
+        extKind = fkInfra
+        extCode = ""
+        extMessage = ""
+        extSeat = -1
+        extRejected = ""
       withLock stateLock:
         for index, seat in seats:
+          if state.disconnected[seat] or not state.playerSockets.hasKey(seat):
+            hasExtFailure = true
+            extKind = fkInfra
+            extCode = "seat_disconnected"
+            extMessage = "seat " & $seat & " disconnected"
+            extSeat = seat
+            break
           if external[seat]:
             state.awaiting[seat] = false
-            if not state.actions[seat].isNil:
+            if state.rejected[seat].len > 0:
+              hasExtFailure = true
+              extKind = fkModelAction
+              extCode = "external_action_rejected"
+              extMessage = "seat " & $seat & " rejected action: " &
+                state.rejected[seat]
+              extSeat = seat
+              extRejected = state.rejectedRaw[seat]
+              break
+            if state.actions[seat].isNil:
+              hasExtFailure = true
+              extKind = fkInfra
+              extCode = "external_action_timeout"
+              extMessage = "seat " & $seat & " missed action deadline"
+              extSeat = seat
+              break
+            try:
               orders[index] = parseOrder(state.actions[seat])
               orders[index].source = osLlm
-            else:
-              orders[index].source = osFallback
-              log "seat " & $seat &
-                " missed action deadline; using steward fallback"
-
-      withLock stateLock:
-        for index, seat in seats:
-          var order = orders[index]
-          order.latencyMs = int(batchSeconds * 1000.0)
-          log "shift " & $(state.sim.shift + 1) & " " & Aliases[seat] &
-            " -> " & $order.job & " " & $order.cube & " (" & $order.source &
-            ")" & (if order.say.len > 0: " says \"" & order.say & "\"" else: "")
-          state.sim.applyOrder(seat, order)
-        ## The tick loop, with a spectator frame every few ticks.
-        for _ in 0 ..< config.ticksPerShift:
-          state.sim.stepTick()
-          if state.sim.tick mod BroadcastEveryTicks == 0:
-            state.broadcastLocked()
-        state.sim.closeShift()
-        state.sim.checkEnd(false)
-        state.sendPlayerStates()
-        state.broadcastLocked()
+            except CatchableError as error:
+              hasExtFailure = true
+              extKind = fkModelAction
+              extCode = "external_action_rejected"
+              extMessage = "seat " & $seat & " invalid action: " &
+                cleanError(error.msg)
+              extSeat = seat
+              extRejected = cleanError($state.actions[seat])
+              break
+        if not hasExtFailure:
+          for index, seat in seats:
+            var order = orders[index]
+            order.latencyMs = int(batchSeconds * 1000.0)
+            log "shift " & $(state.sim.shift + 1) & " " & Aliases[seat] &
+              " -> " & $order.job & " " & $order.cube & " (" & $order.source &
+              ")" & (if order.say.len > 0: " says \"" & order.say & "\"" else: "")
+            state.sim.applyOrder(seat, order)
+          ## The tick loop, with a spectator frame every few ticks.
+          for _ in 0 ..< config.ticksPerShift:
+            state.sim.stepTick()
+            if state.sim.tick mod BroadcastEveryTicks == 0:
+              state.broadcastLocked()
+          state.sim.closeShift()
+          state.sim.checkEnd(false)
+          state.sendPlayerStates()
+          state.broadcastLocked()
+      if hasExtFailure:
+        failEpisode(runtimeConfig, extKind, extCode, extMessage, extSeat,
+          extRejected)
+        return
 
       ## Floor the spacing between batch STARTS so the episode cannot exceed
       ## the Bedrock sidecar's 30 rpm per-episode ceiling.
@@ -561,41 +766,86 @@ proc websocketHandler(
         return
       try:
         let payload = parseJson(message.data)
-        if payload{"type"}.getStr() == "register":
-          if payload["control"].getStr() != "external":
+        if payload.kind != JObject:
+          raise newException(FactoryError, "player frame must be a JSON object")
+        let frameType = payload{"type"}
+        if frameType.isNil or frameType.kind != JString:
+          raise newException(FactoryError, "player frame missing string type")
+        case frameType.getStr()
+        of "register":
+          let control = payload{"control"}
+          if control.isNil or control.kind != JString or
+              control.getStr() != "external":
             raise newException(FactoryError, "unknown player control")
+          var ignored = false
           withLock stateLock:
-            state.external[slot] = true
-          log "seat " & $slot & " registered external action control"
-          return
-        if payload{"type"}.getStr() == "action":
+            if state.started and state.registered[slot]:
+              ignored = true
+            else:
+              state.external[slot] = true
+              state.scripted[slot] = skNone
+              state.registered[slot] = true
+          if not ignored:
+            log "seat " & $slot & " registered external action control"
+        of "action":
           withLock stateLock:
-            if state.external[slot] and state.awaiting[slot] and
-                payload["shift"].getInt() == state.sim.shift:
-              let action = payload["action"]
+            if state.external[slot] and state.awaiting[slot]:
+              let shiftNode = payload{"shift"}
+              if shiftNode.isNil or shiftNode.kind != JInt:
+                raise newException(FactoryError, "action missing integer shift")
+              if shiftNode.getInt() != state.sim.shift:
+                raise newException(FactoryError,
+                  "action shift " & $shiftNode.getInt() &
+                  " does not match current shift " & $state.sim.shift)
+              let action = payload{"action"}
               let order = parseOrder(action)
               if $order.job notin state.sim.legalJobs():
-                raise newException(FactoryError, "job is not legal")
+                raise newException(FactoryError,
+                  "job is not legal: " & $order.job)
               state.actions[slot] = action
-          return
-        if payload{"type"}.getStr() != "prompt":
-          log "ignoring player frame of type " & payload{"type"}.getStr()
-          return
-        var prompt = payload{"prompt"}.getStr()
-        if prompt.runeLen > MaxPromptLen:
-          prompt = prompt.runeSubStr(0, MaxPromptLen)
-        let node = payload{"scripted"}
-        let kind =
-          if node.isNil: skNone
-          elif node.kind == JBool: (if node.getBool(): skSteward else: skNone)
-          else: parseScriptKind(node.getStr())
-        withLock stateLock:
-          state.prompts[slot] = prompt
-          state.scripted[slot] = kind
-        log "seat " & $slot & " delivered a prompt (" & $prompt.len &
-          " chars" & (if kind != skNone: ", scripted " & $kind else: "") & ")"
+        of "prompt":
+          let promptNode = payload{"prompt"}
+          var prompt = ""
+          if not promptNode.isNil and promptNode.kind != JNull:
+            if promptNode.kind != JString:
+              raise newException(FactoryError, "prompt must be a string")
+            prompt = promptNode.getStr()
+          if prompt.runeLen > MaxPromptLen:
+            prompt = prompt.runeSubStr(0, MaxPromptLen)
+          let node = payload{"scripted"}
+          var kind = skNone
+          if not node.isNil and node.kind != JNull:
+            if node.kind != JString:
+              raise newException(FactoryError, "scripted must be a string")
+            let scriptedText = node.getStr().strip()
+            if scriptedText.len > 0:
+              kind = parseScriptKind(scriptedText)
+              if kind == skNone:
+                raise newException(FactoryError,
+                  "unknown scripted baseline: " & cleanError(scriptedText))
+          var ignored = false
+          withLock stateLock:
+            if state.started and state.registered[slot]:
+              ignored = true
+            else:
+              state.prompts[slot] = prompt
+              state.scripted[slot] = kind
+              state.external[slot] = false
+              state.registered[slot] = true
+          if not ignored:
+            log "seat " & $slot & " delivered a prompt (" & $prompt.len &
+              " chars" & (if kind != skNone: ", scripted " & $kind else: "") & ")"
+        else:
+          raise newException(FactoryError,
+            "unknown player frame type: " & cleanError(frameType.getStr()))
       except CatchableError as error:
-        log "ignoring bad player frame: " & cleanError(error.msg)
+        let reason = cleanError(error.msg)
+        withLock stateLock:
+          if state.external[slot] and state.awaiting[slot] and
+              state.rejected[slot].len == 0:
+            state.rejected[slot] = reason
+            state.rejectedRaw[slot] = cleanError(message.data)
+        log "rejected player frame from seat " & $slot & ": " & reason
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -605,6 +855,9 @@ proc websocketHandler(
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
+            if state.started and not state.finished and
+                slot >= 0 and slot < state.disconnected.len:
+              state.disconnected[slot] = true
         state.globalSockets.excl(websocket)
         state.viewerStates.del(websocket)
 
@@ -630,8 +883,12 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](config.numAgents)
   state.scripted = newSeq[ScriptKind](config.numAgents)
   state.external = newSeq[bool](config.numAgents)
+  state.registered = newSeq[bool](config.numAgents)
+  state.disconnected = newSeq[bool](config.numAgents)
   state.awaiting = newSeq[bool](config.numAgents)
   state.actions = newSeq[JsonNode](config.numAgents)
+  state.rejected = newSeq[string](config.numAgents)
+  state.rejectedRaw = newSeq[string](config.numAgents)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter()

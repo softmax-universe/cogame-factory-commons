@@ -10,7 +10,8 @@
 
 import
   std/[json, options, os, strutils],
-  whisky
+  whisky,
+  factory_commons/scripted as fcScripted
 
 const DefaultPrompt = """
 You run this plant and you intend it to be running at the final whistle. Read
@@ -33,9 +34,13 @@ when isMainModule:
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   var prompt = getEnv("PLAYER_PROMPT")
-  if prompt.len == 0:
+  var scripted = getEnv("PLAYER_SCRIPTED").strip().toLowerAscii()
+  if scripted.len > 0:
+    if fcScripted.parseScriptKind(scripted) == fcScripted.skNone:
+      quit("PLAYER_SCRIPTED must be one of steward, stripper, freerider; got: " & scripted, 1)
+    prompt = ""
+  elif prompt.len == 0:
     prompt = DefaultPrompt
-  let scripted = getEnv("PLAYER_SCRIPTED").strip()
 
   proc promptFrame(): string =
     $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
@@ -92,6 +97,12 @@ when isMainModule:
         echo "factory-commons player: final scores ", payload{"scores"},
           " reason ", payload{"reason"}.getStr(),
           " ending ", payload{"ending"}.getStr()
+        running = false
+      of "error":
+        echo "factory-commons player: episode failed (",
+          payload{"failure_kind"}.getStr(), "/",
+          payload{"failure_code"}.getStr(), "): ",
+          payload{"message"}.getStr()
         running = false
       else:
         discard

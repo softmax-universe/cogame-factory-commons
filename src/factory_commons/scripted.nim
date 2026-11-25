@@ -1,6 +1,5 @@
 ## The three scripted baselines. All three are fieldable policies; `steward`
-## and `stripper` are the league fillers, and `steward` is also the order every
-## failed LLM decision lands on.
+## and `stripper` are the league fillers.
 ##
 ## Each decides once per shift purely from the observation and its own slot
 ## number — no shared state, so identical baselines coordinate implicitly by
@@ -18,12 +17,11 @@ type
     skFreerider = "freerider"
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## `PLAYER_SCRIPTED` values. "1"/"true"/"yes" mean the working baseline,
-  ## which is what a bare boolean should get.
+  ## Canonical `PLAYER_SCRIPTED` values: steward, stripper, freerider.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "steward": skSteward
-  of "stripper", "exploiter": skStripper
-  of "freerider", "free-rider", "camper": skFreerider
+  of "steward": skSteward
+  of "stripper": skStripper
+  of "freerider": skFreerider
   else: skNone
 
 proc chuteBananas(sim: Sim): int =

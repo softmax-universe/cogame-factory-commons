@@ -123,10 +123,10 @@ proc playMix(config: GameConfig, kinds: array[SeatCount, ScriptKind],
     check shift <= config.shifts,
       label & ": the episode must end at or before the shift limit"
   check sim.cubesConserved(), label & ": cubes are conserved to the last tick"
-  check sim.reason in ["complete", "deadline", "forfeit"],
-    label & ": reason is one of the three legal values, got " & sim.reason
+  check sim.reason in ["complete", "deadline"],
+    label & ": reason is one of the two legal values, got " & sim.reason
   check sim.ending in
-    ["shift_limit", "factory_ruined", "deadline", "forfeit"],
+    ["shift_limit", "factory_ruined", "deadline"],
     label & ": ending is legal, got " & sim.ending
   ## Every recorded action came out of the ten-value vocabulary by
   ## construction (the kernel returns an `Action`), so the check that matters

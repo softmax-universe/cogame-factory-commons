@@ -1,6 +1,7 @@
-## The decision layer: tolerant parsing, the retry, the fallback, and the ONE
-## PARALLEL BATCH per shift that makes a simultaneous-decision game fit inside
-## its wall-clock budget.
+## The decision layer: strict single-object JSON extraction, schema validation,
+## one retry batch, no silent fallback moves, and the ONE PARALLEL BATCH per
+## shift that makes a simultaneous-decision game fit inside its wall-clock
+## budget.
 ##
 ## The stubbed cases are PROCS, not module-level blocks: a `var` in a top-level
 ## block is a GLOBAL in Nim, and a `{.gcsafe.}` transport closure may not touch
@@ -15,7 +16,7 @@ import std/[json, strutils, unicode]
 
 import curly
 
-import factory_commons/[sim, scripted, llm]
+import factory_commons/[sim, scripted, llm, replays]
 
 var checks = 0
 
@@ -40,17 +41,36 @@ proc reply(text: string): string =
 block extraction:
   check extractJsonObject("{\"job\":\"eat\"}"){"job"}.getStr() == "eat",
     "a bare object parses"
+  check extractJsonObject("  \n{\"job\":\"eat\"}\n  "){"job"}.getStr() == "eat",
+    "a whitespace-padded bare object parses"
   check extractJsonObject("```json\n{\"job\":\"idle\"}\n```"){"job"}.getStr() ==
-    "idle", "a fenced object parses"
-  check extractJsonObject(
-    "Sure! Here is my order:\n{\"job\":\"maintain\"}\nHope that helps."
-  ){"job"}.getStr() == "maintain", "a prose-wrapped object parses"
-  var raised = false
-  try:
-    discard extractJsonObject("I would rather not say.")
-  except FactoryError:
-    raised = true
-  check raised, "a reply with no object raises, quoting the head"
+    "idle", "a json-tagged fenced object parses"
+  check extractJsonObject("```JSON\n{\"job\":\"idle\"}\n```"){"job"}.getStr() ==
+    "idle", "an uppercase JSON-tagged fenced object parses"
+  check extractJsonObject("```\n{\"job\":\"maintain\"}\n```"){"job"}.getStr() ==
+    "maintain", "a plain fenced object parses"
+  check extractJsonObject("```json\r\n{\"job\":\"operate\"}\r\n```"){"job"}.getStr() ==
+    "operate", "CRLF fenced object parses"
+
+  for bad in [
+    "I would rather not say.",
+    "Sure! Here is my order:\n{\"job\":\"maintain\"}\nHope that helps.",
+    "Here:\n```json\n{\"job\":\"eat\"}\n```",
+    "```json\n{\"job\":\"eat\"}\n```\nThanks!",
+    "{\"job\":\"eat\"}\n{\"job\":\"idle\"}",
+    "{\"job\":\"eat\"}{\"job\":\"idle\"}",
+    "```json\n{\"job\":\"eat\"}\n```\n```json\n{\"job\":\"idle\"}\n```",
+    "```python\n{\"job\":\"eat\"}\n```",
+    "[\"operate\"]",
+    "```json\n[\"operate\"]\n```",
+    "```json\n{\"job\":\"eat\"}"
+  ]:
+    var raised = false
+    try:
+      discard extractJsonObject(bad)
+    except FactoryError:
+      raised = true
+    check raised, "invalid or ambiguous reply is rejected: " & bad
 
 # ---------------------------------------------------------------- the schema
 block replySchema:
@@ -93,6 +113,24 @@ block replySchema:
     let order = parseOrder(parseJson("{\"job\":\" MAINTAIN \",\"cube\":\"BLUE\"}"))
     check order.job == jMaintain and order.cube == ccBlue,
       "a job or cube is normalised before the enum check"
+  block badSayAndNotesTypes:
+    for bad in [
+      "{\"job\":\"eat\",\"say\":123}",
+      "{\"job\":\"eat\",\"notes\":[\"a\"]}"
+    ]:
+      var raised = false
+      try:
+        discard parseOrder(parseJson(bad))
+      except FactoryError:
+        raised = true
+      check raised, "non-string say/notes is rejected: " & bad
+  block scriptedAliasesRemoved:
+    check parseScriptKind("steward") == skSteward, "steward parses"
+    check parseScriptKind("stripper") == skStripper, "stripper parses"
+    check parseScriptKind("freerider") == skFreerider, "freerider parses"
+    for legacy in ["1", "true", "yes", "exploiter", "free-rider", "camper"]:
+      check parseScriptKind(legacy) == skNone,
+        "legacy scripted alias rejected: " & legacy
   block runeCaps:
     var long = ""
     for _ in 0 ..< MaxSayLen + 40:
@@ -171,7 +209,7 @@ proc scriptedSeatsAreNotBatched() =
     "a seat that REGISTERED as scripted is not a fallback"
   check orders[2].job == jStrip, "and the stripper strips"
 
-proc invalidRepliesRetryOnceThenFallBack() =
+proc invalidRepliesRetryOnceThenFail() =
   var attempts: seq[int]
   proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
     attempts.add(batch.len)
@@ -183,21 +221,22 @@ proc invalidRepliesRetryOnceThenFallBack() =
   let config = baseConfig()
   var sim = initSim(config)
   let client = newStubLlmClient(config, stub)
-  let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-    @[skNone, skNone, skNone], PromptSelection())
+  var raised = false
+  var errKind = fkInfra
+  var errRejected = ""
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+      @[skNone, skNone, skNone], PromptSelection())
+  except DecisionError as error:
+    raised = true
+    errKind = error.kind
+    errRejected = error.rejectedAction
+  check raised, "invalid replies raise instead of substituting a fallback move"
+  check errKind == fkModelAction, "invalid reply is classified as model_invalid_action"
+  check "decline" in errRejected, "invalid reply records rejectedAction diagnostics"
   check attempts.len == 2, "one batch plus exactly one retry batch"
   check attempts[0] == SeatCount and attempts[1] == SeatCount,
     "the retry carries the seats that failed"
-  for index, order in orders:
-    check order.source == osFallback,
-      "seat " & $index & " lands on a scripted order marked source=fallback"
-  ## And the fallback is a legal order that `results.fallbacks` counts.
-  for seat in 0 ..< SeatCount:
-    sim.applyOrder(seat, orders[seat])
-  let results = sim.resultsJson(@[])
-  for seat in 0 ..< SeatCount:
-    check results["fallbacks"][seat].getInt() == 1,
-      "results.fallbacks[" & $seat & "] counts the fallback shift"
 
 proc halfValidRepliesRetryOnlyTheFailures() =
   var second = -1
@@ -225,9 +264,8 @@ proc halfValidRepliesRetryOnlyTheFailures() =
   check orders[1].source == osRetry, "the retried seats are source=retry"
   check orders[2].source == osRetry, "both of them"
 
-proc transportFailuresNeverRaise() =
+proc transportFailuresRaiseInsteadOfFallback() =
   for mode in ["timeout", "429", "403", "junk", "500", "refusal", "cutoff"]:
-    var disabledAfter = false
     proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
       for i in 0 ..< batch.len:
         var response: Response
@@ -259,18 +297,22 @@ proc transportFailuresNeverRaise() =
     let config = baseConfig()
     var sim = initSim(config)
     let client = newStubLlmClient(config, stub)
-    let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-      @[skNone, skNone, skNone], PromptSelection())
-    check orders.len == SeatCount, mode & ": still one order per seat"
-    for order in orders:
-      check order.source == osFallback,
-        mode & ": every seat falls back to the scripted steward"
-      check parseJob($order.job) >= 0, mode & ": and the order is inside the enum"
-    disabledAfter = client.disabled
+    var raised = false
+    var errKind = fkModelAction
+    try:
+      discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+        @[skNone, skNone, skNone], PromptSelection())
+    except DecisionError as error:
+      raised = true
+      errKind = error.kind
+    check raised, mode & ": raises instead of substituting a fallback move"
+    if mode in ["timeout", "429", "403", "junk", "500"]:
+      check errKind == fkInfra, mode & ": classified as infra failure"
+    else:
+      check errKind == fkModelAction, mode & ": classified as model_invalid_action"
     if mode == "403":
-      check disabledAfter,
+      check client.disabled,
         "a 403 disables the client for the rest of the episode"
-      ## Once disabled, a later shift issues NO requests at all.
       var later = 0
       proc counting(batch: RequestBatch): ResponseBatch {.gcsafe.} =
         inc later
@@ -280,18 +322,19 @@ proc transportFailuresNeverRaise() =
           response.body = reply("{\"job\":\"idle\"}")
           result.add((response, ""))
       client.stub = counting
-      discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-        @[skNone, skNone, skNone], PromptSelection())
+      var laterRaised = false
+      try:
+        discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+          @[skNone, skNone, skNone], PromptSelection())
+      except FactoryError:
+        laterRaised = true
+      check laterRaised, "a disabled client still raises for prompt seats"
       check later == 0, "a disabled client issues no further requests"
     else:
-      check not disabledAfter,
+      check not client.disabled,
         mode & ": a transient failure does not disable the client"
 
-proc aRaisingTransportStillAnswersEverySeat() =
-  ## `decideAll` promises never to raise. Every failure the cases above drive
-  ## comes back INSIDE the ResponseBatch; this one is the transport itself
-  ## raising, which is what `curly.makeRequests` may do and what the review
-  ## could not settle by reading. The episode must still get three orders.
+proc aRaisingTransportRaisesWithoutRetry() =
   var batches = 0
   proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
     inc batches
@@ -299,29 +342,23 @@ proc aRaisingTransportStillAnswersEverySeat() =
   let config = baseConfig()
   var sim = initSim(config)
   let client = newStubLlmClient(config, stub)
-  let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-    @[skNone, skNone, skNone], PromptSelection())
+  var raised = false
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+      @[skNone, skNone, skNone], PromptSelection())
+  except FactoryError:
+    raised = true
+  check raised, "a raising transport raises instead of falling back"
   check batches == 1, "a raising transport is not retried inside the shift"
-  check orders.len == SeatCount, "a raising transport still answers every seat"
-  for order in orders:
-    check order.source == osFallback,
-      "and every seat falls back to the scripted steward"
-    check parseJob($order.job) >= 0, "with an order inside the enum"
   check not client.disabled,
     "a raise is transient: the client is not disabled by it"
 
-proc aThrottledSeatWaitsForTheNextShift() =
-  ## design.md: "a 429 is logged and that seat is retried in the NEXT shift's
-  ## batch". Re-asking a rate limiter inside the same shift spends the
-  ## episode's request budget on a refusal, so the 429 seat takes the scripted
-  ## order for this shift — while a seat that merely answered badly is still
-  ## retried once, in the same batch it always was.
+proc aThrottledSeatDoesNotRetrySameShift() =
   var sizes: seq[int]
   proc stub(batch: RequestBatch): ResponseBatch {.gcsafe.} =
     sizes.add(batch.len)
     for i in 0 ..< batch.len:
       var response: Response
-      ## Seat 0 is throttled; seats 1 and 2 answer with junk the first time.
       if batch[i].verb == "POST" and i == 0 and sizes.len == 1:
         response.code = 429
         response.body = "{\"message\":\"Too many requests\"}"
@@ -335,17 +372,18 @@ proc aThrottledSeatWaitsForTheNextShift() =
   let config = baseConfig()
   var sim = initSim(config)
   let client = newStubLlmClient(config, stub)
-  let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-    @[skNone, skNone, skNone], PromptSelection())
+  var raised = false
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+      @[skNone, skNone, skNone], PromptSelection())
+  except FactoryError:
+    raised = true
+  check raised, "a throttled seat fails the shift instead of falling back"
   check sizes.len == 2, "one batch and one retry batch, got " & $sizes.len
   check sizes[0] == 3, "the first batch carries every open seat"
   check sizes[1] == 2,
     "the retry batch carries the two bad replies and NOT the throttled seat, " &
     "got " & $sizes[1]
-  check orders[0].source == osFallback,
-    "the throttled seat plays the scripted steward this shift"
-  check orders[1].source == osRetry and orders[2].source == osRetry,
-    "and the two bad replies are still retried once"
   check not client.disabled, "a 429 does not disable the client"
 
 proc allSeatsThrottledIssueNoRetryBatch() =
@@ -360,29 +398,44 @@ proc allSeatsThrottledIssueNoRetryBatch() =
   let config = baseConfig()
   var sim = initSim(config)
   let client = newStubLlmClient(config, stub)
-  let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-    @[skNone, skNone, skNone], PromptSelection())
+  var raised = false
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
+      @[skNone, skNone, skNone], PromptSelection())
+  except FactoryError:
+    raised = true
+  check raised, "a fully throttled shift raises instead of falling back"
   check batches == 1,
     "a fully throttled shift issues ONE batch, not two, got " & $batches
-  for order in orders:
-    check order.source == osFallback, "and every seat plays the steward"
 
-proc noCredentialsMeansEverySeatPlaysSteward() =
-  ## The load-bearing offline path: `docker_smoke.sh` and `coworld certify` run
-  ## with no key at all, and the episode must still finish deterministically.
+proc disabledClientFailsPromptSeatsAndAllowsScripted() =
   let config = baseConfig()
   var sim = initSim(config)
-  var client = newLlmClient(config)
-  if client.disabled:
-    let orders = client.decideAll(sim, @[0, 1, 2], @["a", "b", "c"],
-      @[skNone, skNone, skNone], PromptSelection())
-    for order in orders:
-      check order.source == osFallback,
-        "a prompt seat with no credentials is a FALLBACK, so it is counted"
-      check parseJob($order.job) >= 0, "and its order is inside the enum"
-  else:
-    echo "  (ANTHROPIC_API_KEY present in the environment; " &
-      "skipping the offline assertion)"
+  let client = LlmClient(
+    model: config.model,
+    maxOutputTokens: config.maxOutputTokens,
+    timeoutSeconds: config.llmTimeoutSeconds,
+    transport: ltNone,
+    disabled: true
+  )
+  let scriptedOrders = client.decideAll(sim, @[0, 1, 2], @["", "", ""],
+    @[skSteward, skStripper, skFreerider], PromptSelection())
+  check scriptedOrders.len == SeatCount, "scripted seats still run offline"
+  for order in scriptedOrders:
+    check order.source == osScripted, "genuine scripted seats stay source=scripted"
+  var raised = false
+  var errKind = fkModelAction
+  var errCode = ""
+  try:
+    discard client.decideAll(sim, @[0, 1, 2], @["a", "", ""],
+      @[skNone, skSteward, skStripper], PromptSelection())
+  except DecisionError as error:
+    raised = true
+    errKind = error.kind
+    errCode = error.code
+  check raised, "a prompt seat with no credentials raises instead of falling back"
+  check errKind == fkInfra and errCode == "llm_missing_credentials",
+    "missing credentials classified as infra / llm_missing_credentials"
 
 block pacingHonoursMinTurnSeconds:
   var config = baseConfig()
@@ -438,13 +491,13 @@ block theEpisodeSETTLESInsideThePlayBudget:
 
 oneBatchCarriesEveryOpenSeat()
 scriptedSeatsAreNotBatched()
-invalidRepliesRetryOnceThenFallBack()
+invalidRepliesRetryOnceThenFail()
 halfValidRepliesRetryOnlyTheFailures()
-transportFailuresNeverRaise()
-aRaisingTransportStillAnswersEverySeat()
-aThrottledSeatWaitsForTheNextShift()
+transportFailuresRaiseInsteadOfFallback()
+aRaisingTransportRaisesWithoutRetry()
+aThrottledSeatDoesNotRetrySameShift()
 allSeatsThrottledIssueNoRetryBatch()
-noCredentialsMeansEverySeatPlaysSteward()
+disabledClientFailsPromptSeatsAndAllowsScripted()
 
 block promptsCarryTheContract:
   let config = baseConfig()
