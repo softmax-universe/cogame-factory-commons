@@ -144,7 +144,7 @@ The tests are the design note's own enforcement:
 | `tests/test_baseline.nim` | bounded, legal orders over 12 seeds × 4 variants × 6 seat mixes, with the board invariants checked every tick. |
 | `tests/test_feasibility.nim` | the economy: gates (a)–(e). A constant change that breaks the dilemma fails **here**, with the repair ladder in the failure message. |
 | `tests/test_replay.nim` | an end-to-end episode, then a strict-UTF-8 re-read of the bytes — including full-cap multi-byte `say`/`notes`. |
-| `tests/test_llm.nim` | tolerant parsing, the retry, the fallback, and that **one batch carries every open seat**. |
+| `tests/test_llm.nim` | strict JSON parsing, no-retry failure attribution, and that **one batch carries every open seat**. |
 | `tests/test_manifest.nim` | the packaging contract, and that **every variant's `game_config` constructs a sim**. |
 | `tests/test_broadcast.nim` | the chrome frame's shape, the sprite-id audit, and a **scope-duplication** check over `chrome_common.js`'s alias list. |
 

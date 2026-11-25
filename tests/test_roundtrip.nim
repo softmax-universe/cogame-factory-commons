@@ -6,12 +6,14 @@
 ##      executes the model-produced action, and writes scored results + replay.
 ##   2. Native model player with Markdown-fenced JSON reply completes and
 ##      executes the model-produced action.
-##   3. Invalid/ambiguous model reply fails non-zero with model_invalid_action
-##      diagnostics, rejected_action recorded, and NO numeric results.json.
-##   4. Provider failure (HTTP 500) fails non-zero with infra diagnostics and
-##      NO numeric results.json.
+##   3. Invalid/ambiguous model reply fails non-zero without retrying, writes
+##      Coworld's closed GamePlayerFailure JSON with kind="player_error" for the
+##      actual failing seat, logs detailed diagnostics, and writes NO results.json.
+##   4. Provider outage (HTTP 503) fails non-zero without retrying, writes
+##      Coworld's closed GamePlayerFailure JSON with kind="episode_inconclusive"
+##      for the actual interrupted seat, and writes NO results.json.
 ##   5. Missing LLM credentials on native model player fails non-zero with
-##      infra/llm_missing_credentials diagnostics and NO numeric results.json.
+##      kind="episode_inconclusive" and NO results.json.
 ##   6. Purely scripted offline certification seats complete with exit 0 and
 ##      scored results + replay without any LLM credentials.
 
@@ -51,12 +53,18 @@ import http.server, json, sys
 
 status = int(sys.argv[1])
 body = sys.argv[2].encode("utf-8")
+log_path = sys.argv[3]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length > 0:
             self.rfile.read(length)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "path": self.path,
+                "slot": self.headers.get("X-Coworld-Player-Slot")
+            }) + "\n")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -70,14 +78,44 @@ print(server.server_address[1], flush=True)
 server.serve_forever()
 """
 
-proc startStubSidecar(status: int, body: string): tuple[procObj: Process, port: int] =
+proc startStubSidecar(status: int, body, logPath: string): tuple[procObj: Process, port: int] =
+  if fileExists(logPath):
+    removeFile(logPath)
   let p = startProcess(
     "python3",
-    args = ["-u", "-c", StubServerScript, $status, body],
+    args = ["-u", "-c", StubServerScript, $status, body, logPath],
     options = {poUsePath}
   )
   let line = p.outputStream().readLine().strip()
   result = (p, parseInt(line))
+
+proc readStubCalls(logPath: string): seq[JsonNode] =
+  if not fileExists(logPath):
+    return @[]
+  for line in readFile(logPath).splitLines():
+    let trimmed = line.strip()
+    if trimmed.len > 0:
+      result.add(parseJson(trimmed))
+
+proc checkClosedPlayerFailure(failure: JsonNode, expectedSeat: int,
+    expectedKind, label: string) =
+  check failure.kind == JObject, label & ": failure is a JSON object"
+  check failure.len == 3,
+    label & ": closed GamePlayerFailure has exactly 3 keys, got " & $failure
+  check failure.hasKey("failed_policy_index") and
+    failure.hasKey("kind") and failure.hasKey("message"),
+    label & ": closed GamePlayerFailure has exact keys"
+  check failure["failed_policy_index"].kind == JInt and
+    failure["failed_policy_index"].getInt() == expectedSeat,
+    label & ": failed_policy_index == " & $expectedSeat & ", got " &
+    $failure["failed_policy_index"]
+  check failure["kind"].kind == JString and
+    failure["kind"].getStr() == expectedKind,
+    label & ": kind == " & expectedKind & ", got " & $failure["kind"]
+  check failure["message"].kind == JString and
+    failure["message"].getStr().len >= 1 and
+    failure["message"].getStr().len <= 2000,
+    label & ": message length in 1..2000"
 
 proc anthropicTextBody(text: string): string =
   $ %*{"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}
@@ -222,8 +260,10 @@ proc main() =
   compileBinary(root, "src/factory_commons_player.nim", playerBin)
 
   block bareJsonModelRoundTrip:
+    let callsPath = tmpBase / "bare-calls.jsonl"
     let stub = startStubSidecar(200, anthropicTextBody(
-      """{"job":"maintain","cube":"pink","say":"model-bare-json","notes":"ok"}"""))
+      """{"job":"maintain","cube":"pink","say":"model-bare-json","notes":"ok"}"""),
+      callsPath)
     defer:
       stub.procObj.terminate()
       discard stub.procObj.waitForExit(timeout = 2_000)
@@ -252,10 +292,11 @@ proc main() =
       "bare JSON model-produced action executed on seat 0"
 
   block fencedJsonModelRoundTrip:
+    let callsPath = tmpBase / "fenced-calls.jsonl"
     let fenced = "```json\n" &
       """{"job":"eat","cube":"any","say":"model-fenced-json","notes":"fenced"}""" &
       "\n```"
-    let stub = startStubSidecar(200, anthropicTextBody(fenced))
+    let stub = startStubSidecar(200, anthropicTextBody(fenced), callsPath)
     defer:
       stub.procObj.terminate()
       discard stub.procObj.waitForExit(timeout = 2_000)
@@ -282,8 +323,9 @@ proc main() =
       "fenced JSON model-produced action executed on seat 0"
 
   block invalidAmbiguousReplyFailsUnscored:
+    let callsPath = tmpBase / "invalid-calls.jsonl"
     let ambiguous = """Here is my move: {"job":"operate"} {"job":"idle"}"""
-    let stub = startStubSidecar(200, anthropicTextBody(ambiguous))
+    let stub = startStubSidecar(200, anthropicTextBody(ambiguous), callsPath)
     defer:
       stub.procObj.terminate()
       discard stub.procObj.waitForExit(timeout = 2_000)
@@ -292,7 +334,7 @@ proc main() =
     let outcome = runEpisode(
       gameBin, playerBin, tmpBase / "invalid-reply",
       "http://127.0.0.1:" & $stub.port,
-      ["", "steward", "stripper"]
+      ["steward", "", "stripper"]
     )
     check outcome.gameExit != 0,
       "invalid/ambiguous reply exits non-zero; log:\n" & outcome.gameLog
@@ -300,39 +342,39 @@ proc main() =
       "invalid/ambiguous reply writes NO results.json (no numeric results)"
     check outcome.failureExists,
       "invalid/ambiguous reply writes player_failure.json"
-    check outcome.failure["failure_kind"].getStr() == "model_invalid_action",
-      "invalid/ambiguous reply classified as model_invalid_action"
-    check outcome.failure["failure_code"].getStr() == "llm_invalid_reply",
-      "invalid/ambiguous reply records llm_invalid_reply code"
-    check outcome.failure{"rejected_action"}.getStr().len > 0,
-      "invalid/ambiguous reply records rejected_action diagnostics"
-    check not outcome.failure.hasKey("scores") and not outcome.failure.hasKey("win"),
-      "failure diagnostics carry no authoritative gameplay scores or winners"
+    checkClosedPlayerFailure(outcome.failure, 1, "player_error", "invalid reply")
+    check readStubCalls(callsPath).len == 1,
+      "invalid/ambiguous reply issues 1 request without retrying"
+    check "model_invalid_action/llm_invalid_reply" in outcome.gameLog and
+      "rejected_action=" in outcome.gameLog,
+      "game diagnostics log preserves model_invalid_action and rejected_action"
 
-  block providerFailure500FailsUnscored:
-    let stub = startStubSidecar(500, """{"error":"upstream failure"}""")
+  block providerFailure503FailsUnscored:
+    let callsPath = tmpBase / "provider-503-calls.jsonl"
+    let stub = startStubSidecar(503, """{"error":"service unavailable"}""", callsPath)
     defer:
       stub.procObj.terminate()
       discard stub.procObj.waitForExit(timeout = 2_000)
       stub.procObj.close()
 
     let outcome = runEpisode(
-      gameBin, playerBin, tmpBase / "provider-500",
+      gameBin, playerBin, tmpBase / "provider-503",
       "http://127.0.0.1:" & $stub.port,
       ["", "steward", "stripper"]
     )
     check outcome.gameExit != 0,
-      "provider 500 exits non-zero; log:\n" & outcome.gameLog
+      "provider 503 exits non-zero; log:\n" & outcome.gameLog
     check not outcome.resultsExists,
-      "provider 500 writes NO results.json (no numeric results)"
+      "provider 503 writes NO results.json (no numeric results)"
     check outcome.failureExists,
-      "provider 500 writes player_failure.json"
-    check outcome.failure["failure_kind"].getStr() == "infra",
-      "provider 500 classified as infra failure"
-    check outcome.failure["failure_code"].getStr() == "llm_provider_error",
-      "provider 500 records llm_provider_error code"
-    check not outcome.failure.hasKey("scores") and not outcome.failure.hasKey("win"),
-      "provider 500 failure carries no authoritative gameplay scores or winners"
+      "provider 503 writes player_failure.json"
+    checkClosedPlayerFailure(outcome.failure, 0, "episode_inconclusive", "provider 503")
+    check "503" in outcome.failure["message"].getStr(),
+      "provider 503 message preserves HTTP 503 cause"
+    check readStubCalls(callsPath).len == 1,
+      "provider 503 issues 1 request without retrying"
+    check "infra/llm_provider_error" in outcome.gameLog,
+      "game diagnostics log preserves infra/llm_provider_error"
 
   block missingCredentialsFailsUnscored:
     let outcome = runEpisode(
@@ -347,12 +389,10 @@ proc main() =
       "missing credentials writes NO results.json (no numeric results)"
     check outcome.failureExists,
       "missing credentials writes player_failure.json"
-    check outcome.failure["failure_kind"].getStr() == "infra",
-      "missing credentials classified as infra failure"
-    check outcome.failure["failure_code"].getStr() == "llm_missing_credentials",
-      "missing credentials records llm_missing_credentials code"
-    check not outcome.failure.hasKey("scores") and not outcome.failure.hasKey("win"),
-      "missing credentials failure carries no authoritative gameplay scores or winners"
+    checkClosedPlayerFailure(outcome.failure, 0, "episode_inconclusive",
+      "missing credentials")
+    check "llm_missing_credentials" in outcome.failure["message"].getStr(),
+      "missing credentials message preserves cause"
 
   block scriptedCertificationCompletesOffline:
     let outcome = runEpisode(
