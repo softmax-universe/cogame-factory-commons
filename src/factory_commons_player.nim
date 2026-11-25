@@ -10,32 +10,24 @@
 
 import
   std/[json, options, os, strutils],
-  whisky
-
-const DefaultPrompt = """
-You run this plant and you intend it to be running at the final whistle. Read
-integrity and cap first, every shift. Cap is the only number that never
-recovers - if it is still 100, the machine has never been stripped and your job
-is to keep it that way. Rust takes one integrity every twenty ticks, so the
-plant loses about three a shift before anyone touches it: whenever integrity
-drops below 75, take a cube to the bay and `maintain` until it is back up.
-Otherwise `operate`, and pick the cube colour the hopper has least of, because
-a press needs one of each and a lopsided hopper is a stalled machine. Say your
-lane out loud in the form 'operate pink' or 'maintain' so the other two can
-cover what you left. Never strip: four bananas now costs the room sixteen cap
-and costs you every press for the rest of the episode. If a chute cell is
-stacked three deep, go eat - bananas rot in a hundred and eighty ticks and a
-rotted banana helps nobody.
-"""
+  whisky,
+  factory_commons/scripted as fcScripted
 
 when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   var prompt = getEnv("PLAYER_PROMPT")
-  if prompt.len == 0:
-    prompt = DefaultPrompt
-  let scripted = getEnv("PLAYER_SCRIPTED").strip()
+  var scripted = getEnv("PLAYER_SCRIPTED").strip().toLowerAscii()
+  if scripted.len > 0:
+    if fcScripted.parseScriptKind(scripted) == fcScripted.skNone:
+      quit("PLAYER_SCRIPTED must be one of steward, stripper, freerider; got: " & scripted, 1)
+    prompt = ""
+  elif prompt.len == 0:
+    ## When neither PLAYER_PROMPT nor PLAYER_SCRIPTED is set (for example the
+    ## default certification player), explicitly register as the steward
+    ## baseline rather than relying on a server-side fallback.
+    scripted = "steward"
 
   proc promptFrame(): string =
     $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}

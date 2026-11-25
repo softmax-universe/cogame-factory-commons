@@ -6,10 +6,11 @@
 ## its own notes) plus that seat's prompt and asks Claude what job it takes for
 ## the next shift.
 ##
-## Decisions within a shift are SIMULTANEOUS by rule, so all three requests go
-## out as ONE parallel batch (`curly.makeRequests`); invalid replies are retried
-## once as a smaller batch with a hint, and anything still failing falls back to
-## the scripted `steward` order. Deciding in the GAME container is what makes
+## Decisions within a shift are SIMULTANEOUS by rule, so all open prompt seats
+## go out as ONE parallel batch (`curly.makeRequests`); invalid replies are
+## retried once as a smaller batch with a hint, and any seat still failing
+## raises `FactoryError` so the server forfeits the episode rather than silently
+## substituting a scripted move. Deciding in the GAME container is what makes
 ## one parallel batch per turn possible, and is why the coworld secret must be
 ## on the game runnable (hive, 2026-08-23).
 ##
@@ -18,9 +19,8 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With none the client disables itself immediately and every seat plays
-## `steward` — which is what keeps offline certification green and
-## deterministic. That fallback is load-bearing, not a nicety.
+## With none the client disables itself immediately; genuine scripted seats
+## still run deterministically, while any prompt seat fails cleanly.
 
 import
   std/[json, os, strutils, unicode],
@@ -152,7 +152,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    log "llm: no LLM credentials; every seat plays the scripted steward"
+    log "llm: no LLM credentials; prompt seats require credentials"
 
 proc newStubLlmClient*(config: GameConfig, stub: TransportStub): LlmClient =
   ## TEST-ONLY constructor: an enabled client whose transport is `stub`.
@@ -610,16 +610,49 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- transport -------------------------------------------------------------
 
-proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let
-    start = text.find('{')
-    stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    raise newException(FactoryError, "no JSON object in response: " &
+proc unwrapSingleCodeFence(text: string): string =
+  ## Unwraps one ordinary outer Markdown code fence (plain ``` or ```json,
+  ## case-insensitive) when the entire trimmed reply is that single fence.
+  let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+  let nl = trimmed.find('\n')
+  if nl < 0:
+    raise newException(FactoryError, "unterminated code fence in response: " &
       cleanError(text))
-  parseJson(text[start .. stop])
+  let tag = trimmed[3 ..< nl].strip().toLowerAscii()
+  if tag.len > 0 and tag != "json":
+    raise newException(FactoryError,
+      "unsupported code fence tag '" & cleanError(tag) & "' in response")
+  let rest = trimmed[nl + 1 .. ^1]
+  let closeIdx = rest.rfind("```")
+  if closeIdx < 0:
+    raise newException(FactoryError, "unterminated code fence in response: " &
+      cleanError(text))
+  if rest[closeIdx + 3 .. ^1].strip().len > 0:
+    raise newException(FactoryError,
+      "unexpected trailing text after code fence: " & cleanError(text))
+  let body = rest[0 ..< closeIdx]
+  if body.len > 0 and body[^1] != '\n' and body[^1] != '\r':
+    raise newException(FactoryError,
+      "closing code fence must sit on its own line: " & cleanError(text))
+  body.strip()
+
+proc extractJsonObject*(text: string): JsonNode =
+  ## Parses exactly one JSON object, bare or inside a single ordinary outer
+  ## Markdown code fence (plain or json-tagged). Rejects surrounding prose,
+  ## extra objects, and non-object JSON values.
+  let candidate = unwrapSingleCodeFence(text)
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
+    raise newException(FactoryError,
+      "reply must be a single JSON object: " & cleanError(text))
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(FactoryError,
+      "invalid JSON object in response: " & cleanError(error.msg))
+  if result.isNil or result.kind != JObject:
+    raise newException(FactoryError, "reply is not a JSON object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -713,8 +746,20 @@ proc parseOrder*(payload: JsonNode): Order =
         "cube must be one of pink, blue, any: " &
         cleanError(cubeNode.getStr()))
     result.cube = CubeChoice(choice)
-  result.say = cleanSay(payload{"say"}.getStr())
-  result.notes = cleanNotes(payload{"notes"}.getStr())
+  let sayNode = payload{"say"}
+  if sayNode.isNil or sayNode.kind == JNull:
+    result.say = ""
+  elif sayNode.kind != JString:
+    raise newException(FactoryError, "say must be a string")
+  else:
+    result.say = cleanSay(sayNode.getStr())
+  let notesNode = payload{"notes"}
+  if notesNode.isNil or notesNode.kind == JNull:
+    result.notes = ""
+  elif notesNode.kind != JString:
+    raise newException(FactoryError, "notes must be a string")
+  else:
+    result.notes = cleanNotes(notesNode.getStr())
 
 proc orderJson*(order: Order): JsonNode =
   %*{"job": $order.job, "cube": $order.cube, "say": order.say, "notes": order.notes}
@@ -766,26 +811,25 @@ proc decideAll*(
   scripted: seq[ScriptKind],
   selection: PromptSelection
 ): seq[Order] =
-  ## One order per seat in `seats`, in order. NEVER raises: any failure falls
-  ## back to the scripted `steward` order so the episode always advances.
+  ## One order per seat in `seats`, in order. Genuine scripted seats run their
+  ## baseline deterministically; prompt seats go out in ONE parallel batch with
+  ## at most one retry batch for invalid replies. Never silently substitutes a
+  ## scripted fallback move — raises `FactoryError` if any prompt seat fails.
   ## `prompts` and `scripted` are indexed by SEAT.
-  ##
-  ## All open seats go out in ONE batch — this is a simultaneous-decision game
-  ## and querying seats sequentially is what blows the 720 s play budget.
   result = newSeq[Order](seats.len)
-  var open: seq[int]
+  var
+    open: seq[int]
+    failed: seq[int]
+    lastErrors = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone:
       ## A seat that REGISTERED as scripted is playing a baseline on purpose:
-      ## `source: "scripted"`, and it is not a fallback.
+      ## `source: "scripted"`.
       result[index] = sim.scriptedOrder(seat, kind)
     elif client.disabled:
-      ## A PROMPT seat with no usable credentials plays the steward, and that
-      ## IS a fallback — `results.fallbacks[i]` is how phase 60 greps a real
-      ## number instead of guessing.
-      result[index] = sim.scriptedOrder(seat, skSteward)
-      result[index].source = osFallback
+      raise newException(FactoryError,
+        "llm disabled for seat " & $seat & " (no usable LLM credentials)")
     else:
       open.add(index)
 
@@ -803,23 +847,22 @@ proc decideAll*(
       batch.post(request.url, request.headers, request.body, $index)
     client.lastBatchSize = batch.len
     client.batches += 1
-    ## The transport call sits INSIDE the try. `decideAll` promises never to
-    ## raise, and every failure the tests drive arrives inside the
-    ## `ResponseBatch` — but `curly.makeRequests` is the one call here whose
-    ## raising behaviour is not this module's to define, so a raise from it
-    ## must land on the fallback path like any other transport failure.
     var responses: ResponseBatch
     try:
       responses =
         if client.stub != nil: client.stub(batch)
         else: client.curl.makeRequests(batch, client.timeoutSeconds)
     except CatchableError as error:
-      log "llm: batch transport raised: " & cleanError(error.msg)
+      let msg = "llm batch transport raised: " & cleanError(error.msg)
+      log msg
+      for index in open:
+        lastErrors[index] = msg
       break
     var stillOpen: seq[int]
     for position, index in open:
       let seat = seats[index]
       if position >= responses.len:
+        lastErrors[index] = "missing response from LLM batch"
         stillOpen.add(index)
         continue
       try:
@@ -829,23 +872,24 @@ proc decideAll*(
         order.source = if attempt == 0: osLlm else: osRetry
         result[index] = order
       except ThrottledError as error:
-        ## design.md: "a 429 is logged and that seat is retried in the NEXT
-        ## shift's batch". Re-asking a rate limiter that just said no, in the
-        ## same second, spends the episode's request budget on a refusal — so
-        ## this seat takes the scripted order for this shift and comes back in
-        ## the next batch.
-        log "llm: seat " & $seat & " throttled, retrying next shift: " &
-          cleanError(error.msg)
-        result[index] = sim.scriptedOrder(seat, skSteward)
-        result[index].source = osFallback
+        let msg = cleanError(error.msg)
+        log "llm: seat " & $seat & " throttled: " & msg
+        lastErrors[index] = msg
+        failed.add(index)
       except CatchableError as error:
-        log "llm: seat " & $seat & " attempt " & $attempt & " failed: " &
-          cleanError(error.msg)
+        let msg = cleanError(error.msg)
+        log "llm: seat " & $seat & " attempt " & $attempt & " failed: " & msg
+        lastErrors[index] = msg
         stillOpen.add(index)
     open = stillOpen
 
   for index in open:
-    let seat = seats[index]
-    log "llm: seat " & $seat & " falling back to scripted order"
-    result[index] = sim.scriptedOrder(seat, skSteward)
-    result[index].source = osFallback
+    failed.add(index)
+  if failed.len > 0:
+    let first = failed[0]
+    let seat = seats[first]
+    let reason =
+      if lastErrors[first].len > 0: lastErrors[first]
+      else: "no valid order returned"
+    raise newException(FactoryError,
+      "llm decision failed for seat " & $seat & ": " & reason)

@@ -310,8 +310,10 @@ proc endEarly*(sim: var Sim) =
   sim.finish("deadline", "deadline")
 
 proc forfeit*(sim: var Sim) =
-  ## No seat connected inside `playerConnectTimeoutSeconds`. Results AND the
-  ## replay are still written; every score is zero.
+  ## Episode forfeited (missing/disconnected seat, rejected reply, or missed
+  ## deadline). Results AND the replay are still written.
+  if sim.frames.len == 0:
+    sim.captureFrame()
   sim.finish("forfeit", "forfeit")
 
 proc playShift*(sim: var Sim) =

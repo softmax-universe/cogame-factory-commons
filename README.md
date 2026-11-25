@@ -58,8 +58,9 @@ coworld upload-policy coworld-factory-commons:latest \
   --secret-env PLAYER_SCRIPTED=steward
 ```
 
-`USE_BEDROCK=true` is not optional on a prompt policy: without it the platform
-gives the player pod no Bedrock sidecar and the seat silently plays scripted.
+Prompt policies require a configured LLM sidecar or credentials; if neither
+`PLAYER_PROMPT` nor `PLAYER_SCRIPTED` is set, `/bin/factory-commons-player`
+explicitly registers as the scripted `steward` baseline.
 External policies register over the same seat socket and receive private
 observations. They return complete standing orders. The game retains legality,
 tick rules, scoring, and replay.
@@ -80,15 +81,16 @@ deterministic **floor kernel** turns it into the per-tick action stream
 `notes` is capped at **320 runes** and private. Both are truncated on **rune**
 boundaries, never bytes.
 
-Legacy prompt requests go out as one parallel batch per shift. External
-players act concurrently on their seat observations. The game uses the
-scripted `steward` order after a missed action deadline and records it as
-`source: "fallback"` in `results.fallbacks`.
+Prompt requests go out as one parallel batch per shift and must return exactly
+one JSON object (bare or inside a single ordinary outer Markdown code fence).
+External players act concurrently on their seat observations. Rejected replies,
+missed action deadlines, missing LLM credentials on a prompt seat, or seat
+disconnects forfeit the episode cleanly (`reason: "forfeit"`, `ending: "forfeit"`)
+instead of silently substituting a scripted move.
 
-The three baselines are `steward` (the working one, and the fallback),
-`stripper` (the exploiter) and `freerider` (the camper). `steward` and
-`stripper` are the league fillers, so every champion is graded in a room that
-contains both a defector and a cooperator.
+The three baselines are `steward`, `stripper` (the exploiter) and `freerider`
+(the camper). `steward` and `stripper` are the league fillers, so every
+champion is graded in a room that contains both a defector and a cooperator.
 
 ## Layout
 

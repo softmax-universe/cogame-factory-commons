@@ -85,8 +85,10 @@ type
     prompts: seq[string]
     scripted: seq[ScriptKind]
     external: seq[bool]
+    registered: seq[bool]
     awaiting: seq[bool]
     actions: seq[JsonNode]
+    rejected: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -297,31 +299,39 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       config = state.config
       gameStart = epochTime()
       connectDeadline = gameStart + config.playerConnectTimeoutSeconds.float
-    var anyConnected = false
+    var allReady = false
     while epochTime() < connectDeadline:
-      var allConnected = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.numAgents
-        anyConnected = anyConnected or state.playerSockets.len > 0
-      if allConnected:
+        allReady = state.playerSockets.len >= config.numAgents
+        if allReady:
+          for seat in 0 ..< config.numAgents:
+            if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(50)
 
     withLock stateLock:
       state.started = true
-      anyConnected = anyConnected or state.playerSockets.len > 0
+      allReady = state.playerSockets.len >= config.numAgents
+      if allReady:
+        for seat in 0 ..< config.numAgents:
+          if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
+            allReady = false
+            break
       log "starting with " & $state.playerSockets.len & "/" &
         $config.numAgents & " seats connected"
       state.broadcastLocked()
 
-    if not anyConnected:
-      ## Nobody arrived inside the connect timeout. Results AND the replay are
-      ## still written, every score zero, so the episode is a record rather
-      ## than a hole.
-      log "no seat connected within " &
+    if not allReady:
+      ## At least one seat failed to connect and register inside the connect
+      ## timeout. Forfeit cleanly — never substitute a scripted seat.
+      log "not all seats connected and registered within " &
         $config.playerConnectTimeoutSeconds & "s; forfeiting"
       withLock stateLock:
         state.sim.forfeit()
+        state.broadcastLocked()
       finishEpisode(runtimeConfig)
       return
 
@@ -358,6 +368,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         prompts: seq[string]
         scripted: seq[ScriptKind]
         external: seq[bool]
+        disconnectedSeat = -1
       withLock stateLock:
         if state.sim.done:
           break
@@ -370,23 +381,28 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           state.broadcastLocked()
           break
         for seat in 0 ..< state.sim.cogs.len:
+          if not state.playerSockets.hasKey(seat):
+            disconnectedSeat = seat
+            break
           seats.add(seat)
+        if disconnectedSeat >= 0:
+          log "seat " & $disconnectedSeat & " disconnected; forfeiting"
+          state.sim.forfeit()
+          state.broadcastLocked()
+          break
         simCopy = state.sim
         prompts = state.prompts
         scripted = state.scripted
         external = state.external
-        ## A seat that never connected, or whose socket died, plays the steward
-        ## for every remaining shift — the episode never blocks on a socket.
-        for seat in seats:
-          if not state.playerSockets.hasKey(seat) and
-              scripted[seat] == skNone:
-            scripted[seat] = skSteward
         log "shift " & $(state.sim.shift + 1) & " of " & $config.shifts &
           " at " & $(epochTime() - gameStart).int & "s"
 
+      var hasExternal = false
       withLock stateLock:
         for seat in seats:
+          state.rejected[seat] = ""
           if external[seat]:
+            hasExternal = true
             state.awaiting[seat] = true
             state.actions[seat] = nil
             if state.playerSockets.hasKey(seat):
@@ -396,39 +412,85 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 "observation": simCopy.observationJson(seat)
               })
 
+      var managedSeats: seq[int]
       for seat in seats:
-        if external[seat]:
-          scripted[seat] = skSteward
+        if not external[seat]:
+          managedSeats.add(seat)
 
-      ## The slow part (Claude, ONE parallel batch for legacy prompts) runs
-      ## outside the lock on a snapshot; only this thread mutates the sim, so
-      ## the snapshot cannot go stale.
+      ## The slow part (LLM, ONE parallel batch for prompt seats) runs outside
+      ## the lock on a snapshot; only this thread mutates the sim, so the
+      ## snapshot cannot go stale.
       let batchStart = epochTime()
-      var orders = client.decideAll(simCopy, seats, prompts, scripted, state.selection)
+      var orders = newSeq[Order](seats.len)
+      var decisionError = ""
+      if managedSeats.len > 0:
+        try:
+          let managedOrders = client.decideAll(
+            simCopy, managedSeats, prompts, scripted, state.selection)
+          for i, seat in managedSeats:
+            orders[seat] = managedOrders[i]
+        except CatchableError as error:
+          decisionError = cleanError(error.msg)
       let batchSeconds = epochTime() - batchStart
 
-      let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
-      while epochTime() < actionDeadline:
-        var waiting = false
+      if decisionError.len > 0:
+        log "decision failed (" & decisionError & "); forfeiting"
         withLock stateLock:
           for seat in seats:
-            if external[seat] and state.actions[seat].isNil:
-              waiting = true
-        if not waiting:
-          break
-        sleep(20)
+            state.awaiting[seat] = false
+          state.sim.forfeit()
+          state.broadcastLocked()
+        break
 
+      if hasExternal:
+        let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
+        while epochTime() < actionDeadline:
+          var waiting = false
+          var failed = false
+          withLock stateLock:
+            for seat in seats:
+              if not state.playerSockets.hasKey(seat):
+                failed = true
+                break
+              if external[seat]:
+                if state.rejected[seat].len > 0:
+                  failed = true
+                  break
+                if state.actions[seat].isNil:
+                  waiting = true
+          if failed or not waiting:
+            break
+          sleep(20)
+
+      var forfeitReason = ""
       withLock stateLock:
         for index, seat in seats:
+          if not state.playerSockets.hasKey(seat):
+            forfeitReason = "seat " & $seat & " disconnected"
+            break
           if external[seat]:
             state.awaiting[seat] = false
-            if not state.actions[seat].isNil:
+            if state.rejected[seat].len > 0:
+              forfeitReason = "seat " & $seat & " rejected action: " &
+                state.rejected[seat]
+              break
+            if state.actions[seat].isNil:
+              forfeitReason = "seat " & $seat & " missed action deadline"
+              break
+            try:
               orders[index] = parseOrder(state.actions[seat])
               orders[index].source = osLlm
-            else:
-              orders[index].source = osFallback
-              log "seat " & $seat &
-                " missed action deadline; using steward fallback"
+            except CatchableError as error:
+              forfeitReason = "seat " & $seat & " invalid action: " &
+                cleanError(error.msg)
+              break
+        if forfeitReason.len > 0:
+          for seat in seats:
+            state.awaiting[seat] = false
+          log forfeitReason & "; forfeiting"
+          state.sim.forfeit()
+          state.broadcastLocked()
+          break
 
       withLock stateLock:
         for index, seat in seats:
@@ -561,41 +623,75 @@ proc websocketHandler(
         return
       try:
         let payload = parseJson(message.data)
-        if payload{"type"}.getStr() == "register":
-          if payload["control"].getStr() != "external":
+        if payload.kind != JObject:
+          raise newException(FactoryError, "player frame must be a JSON object")
+        let frameType = payload{"type"}
+        if frameType.isNil or frameType.kind != JString:
+          raise newException(FactoryError, "player frame missing string type")
+        case frameType.getStr()
+        of "register":
+          let control = payload{"control"}
+          if control.isNil or control.kind != JString or
+              control.getStr() != "external":
             raise newException(FactoryError, "unknown player control")
           withLock stateLock:
             state.external[slot] = true
+            state.scripted[slot] = skNone
+            state.registered[slot] = true
           log "seat " & $slot & " registered external action control"
-          return
-        if payload{"type"}.getStr() == "action":
+        of "action":
           withLock stateLock:
-            if state.external[slot] and state.awaiting[slot] and
-                payload["shift"].getInt() == state.sim.shift:
-              let action = payload["action"]
+            if state.external[slot] and state.awaiting[slot]:
+              let shiftNode = payload{"shift"}
+              if shiftNode.isNil or shiftNode.kind != JInt:
+                raise newException(FactoryError, "action missing integer shift")
+              if shiftNode.getInt() != state.sim.shift:
+                raise newException(FactoryError,
+                  "action shift " & $shiftNode.getInt() &
+                  " does not match current shift " & $state.sim.shift)
+              let action = payload{"action"}
               let order = parseOrder(action)
               if $order.job notin state.sim.legalJobs():
-                raise newException(FactoryError, "job is not legal")
+                raise newException(FactoryError,
+                  "job is not legal: " & $order.job)
               state.actions[slot] = action
-          return
-        if payload{"type"}.getStr() != "prompt":
-          log "ignoring player frame of type " & payload{"type"}.getStr()
-          return
-        var prompt = payload{"prompt"}.getStr()
-        if prompt.runeLen > MaxPromptLen:
-          prompt = prompt.runeSubStr(0, MaxPromptLen)
-        let node = payload{"scripted"}
-        let kind =
-          if node.isNil: skNone
-          elif node.kind == JBool: (if node.getBool(): skSteward else: skNone)
-          else: parseScriptKind(node.getStr())
-        withLock stateLock:
-          state.prompts[slot] = prompt
-          state.scripted[slot] = kind
-        log "seat " & $slot & " delivered a prompt (" & $prompt.len &
-          " chars" & (if kind != skNone: ", scripted " & $kind else: "") & ")"
+        of "prompt":
+          let promptNode = payload{"prompt"}
+          var prompt = ""
+          if not promptNode.isNil and promptNode.kind != JNull:
+            if promptNode.kind != JString:
+              raise newException(FactoryError, "prompt must be a string")
+            prompt = promptNode.getStr()
+          if prompt.runeLen > MaxPromptLen:
+            prompt = prompt.runeSubStr(0, MaxPromptLen)
+          let node = payload{"scripted"}
+          var kind = skNone
+          if not node.isNil and node.kind != JNull:
+            if node.kind != JString:
+              raise newException(FactoryError, "scripted must be a string")
+            let scriptedText = node.getStr().strip()
+            if scriptedText.len > 0:
+              kind = parseScriptKind(scriptedText)
+              if kind == skNone:
+                raise newException(FactoryError,
+                  "unknown scripted baseline: " & cleanError(scriptedText))
+          withLock stateLock:
+            state.prompts[slot] = prompt
+            state.scripted[slot] = kind
+            state.external[slot] = false
+            state.registered[slot] = true
+          log "seat " & $slot & " delivered a prompt (" & $prompt.len &
+            " chars" & (if kind != skNone: ", scripted " & $kind else: "") & ")"
+        else:
+          raise newException(FactoryError,
+            "unknown player frame type: " & cleanError(frameType.getStr()))
       except CatchableError as error:
-        log "ignoring bad player frame: " & cleanError(error.msg)
+        let reason = cleanError(error.msg)
+        withLock stateLock:
+          if state.external[slot] and state.awaiting[slot] and
+              state.rejected[slot].len == 0:
+            state.rejected[slot] = reason
+        log "rejected player frame from seat " & $slot & ": " & reason
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -630,8 +726,10 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](config.numAgents)
   state.scripted = newSeq[ScriptKind](config.numAgents)
   state.external = newSeq[bool](config.numAgents)
+  state.registered = newSeq[bool](config.numAgents)
   state.awaiting = newSeq[bool](config.numAgents)
   state.actions = newSeq[JsonNode](config.numAgents)
+  state.rejected = newSeq[string](config.numAgents)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter()

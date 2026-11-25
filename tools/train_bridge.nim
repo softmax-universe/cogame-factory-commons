@@ -124,7 +124,7 @@ when isMainModule:
       response = %*{"response": $(if textMode: orderJson(order) else: %*{"job": $order.job, "cube": $order.cube})}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let action = extractJsonObject(request["response"].getStr())
       var order = parseOrder(action)
       if not textMode: doAssert $order.job in game.legalJobs()
       order.source = osLlm
