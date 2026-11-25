@@ -86,6 +86,7 @@ type
     scripted: seq[ScriptKind]
     external: seq[bool]
     registered: seq[bool]
+    disconnected: seq[bool]
     awaiting: seq[bool]
     actions: seq[JsonNode]
     rejected: seq[string]
@@ -220,10 +221,18 @@ proc broadcastLocked(gs: var GameState) =
       socket.send(blobFromBytes(chunk), BinaryMessage)
   lastBroadcastTick = max(0, gs.sim.tick - 1)
 
-proc sendPlayerStates(gs: GameState) =
+proc sendPlayerStates(gs: var GameState) =
+  var deadSlots: seq[int]
   for slot, socket in gs.playerSockets:
     if slot < gs.sim.cogs.len:
-      socket.send($gs.sim.observationJson(slot))
+      try:
+        socket.send($gs.sim.observationJson(slot))
+      except CatchableError:
+        deadSlots.add(slot)
+  for slot in deadSlots:
+    gs.playerSockets.del(slot)
+    if gs.started and not gs.finished and slot >= 0 and slot < gs.disconnected.len:
+      gs.disconnected[slot] = true
 
 proc writeArtifact(uri, data, contentType, methodEnv: string) =
   ## Writes a Coworld artifact, honouring the platform's PUT/POST method hint.
@@ -277,7 +286,10 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.sendPlayerStates()
     for slot, socket in state.playerSockets:
       final["slot"] = %slot
-      socket.send($final)
+      try:
+        socket.send($final)
+      except CatchableError:
+        discard
     state.broadcastLocked()
 
   sleep(500)
@@ -365,12 +377,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       config = state.config
       gameStart = epochTime()
       connectDeadline = gameStart + config.playerConnectTimeoutSeconds.float
-    var
-      anyConnected = false
-      allReady = false
+    var allReady = false
     while epochTime() < connectDeadline:
       withLock stateLock:
-        anyConnected = anyConnected or state.playerSockets.len > 0
         allReady = state.playerSockets.len >= config.numAgents
         if allReady:
           for seat in 0 ..< config.numAgents:
@@ -381,11 +390,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(50)
 
-    var missingSeat = -1
+    var
+      missingSeat = -1
+      connectedCount = 0
     withLock stateLock:
       state.started = true
-      anyConnected = anyConnected or state.playerSockets.len > 0
-      allReady = state.playerSockets.len >= config.numAgents
+      connectedCount = state.playerSockets.len
+      allReady = connectedCount >= config.numAgents
       if allReady:
         for seat in 0 ..< config.numAgents:
           if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
@@ -397,28 +408,23 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if not state.playerSockets.hasKey(seat) or not state.registered[seat]:
             missingSeat = seat
             break
-      log "starting with " & $state.playerSockets.len & "/" &
+      log "starting with " & $connectedCount & "/" &
         $config.numAgents & " seats connected"
       state.broadcastLocked()
 
-    if not anyConnected:
-      ## Pre-existing rule (`docs/plans/2026-08-25-factory-commons-design.md:348`,
-      ## `coworld_manifest_template.json:464`): ONLY when no seat connected
-      ## within `playerConnectTimeoutSeconds = 180` is the episode forfeited.
-      log "no seat connected within " &
-        $config.playerConnectTimeoutSeconds & "s; forfeiting"
-      withLock stateLock:
-        state.sim.forfeit()
-        state.broadcastLocked()
-      finishEpisode(runtimeConfig)
-      return
-
     if not allReady:
-      ## Partial connect/registration timeout is an infrastructure/startup
-      ## failure, never an invented forfeit or silent scripted substitution.
-      failEpisode(runtimeConfig, fkInfra, "seat_connect_timeout",
-        "seat " & $missingSeat & " did not connect and register within " &
-        $config.playerConnectTimeoutSeconds & "s", missingSeat)
+      ## Missing or unregistered seats (whether zero or partial) are an
+      ## infrastructure/startup failure, never an invented forfeit or silent
+      ## scripted substitution.
+      let msg =
+        if connectedCount == 0:
+          "no seats connected and registered within " &
+          $config.playerConnectTimeoutSeconds & "s"
+        else:
+          "seat " & $missingSeat & " did not connect and register within " &
+          $config.playerConnectTimeoutSeconds & "s"
+      failEpisode(runtimeConfig, fkInfra, "seat_connect_timeout", msg,
+        if connectedCount == 0: -1 else: missingSeat)
       return
 
     let client = newLlmClient(config)
@@ -455,35 +461,46 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         scripted: seq[ScriptKind]
         external: seq[bool]
         disconnectedSeat = -1
+        disconnectedShift = 0
+        deadlineBeforeFirstShift = false
       withLock stateLock:
         if state.sim.done:
           break
         if not config.shiftFitsBeforeDeadline(epochTime(), playDeadline):
-          log "play deadline reached after " & $state.sim.shift & "/" &
-            $config.shifts & " shifts (a shift needs " &
-            $config.shiftBudgetSeconds() & "s and settling " &
-            $config.settleBudgetSeconds() & "s); ending early"
-          state.sim.endEarly()
-          state.broadcastLocked()
-          break
-        for seat in 0 ..< state.sim.cogs.len:
-          if not state.playerSockets.hasKey(seat):
-            disconnectedSeat = seat
+          if state.sim.shift == 0:
+            deadlineBeforeFirstShift = true
+          else:
+            log "play deadline reached after " & $state.sim.shift & "/" &
+              $config.shifts & " shifts (a shift needs " &
+              $config.shiftBudgetSeconds() & "s and settling " &
+              $config.settleBudgetSeconds() & "s); ending early"
+            state.sim.endEarly()
+            state.broadcastLocked()
             break
-          seats.add(seat)
-        if disconnectedSeat >= 0:
-          break
-        simCopy = state.sim
-        prompts = state.prompts
-        scripted = state.scripted
-        external = state.external
-        log "shift " & $(state.sim.shift + 1) & " of " & $config.shifts &
-          " at " & $(epochTime() - gameStart).int & "s"
+        if not deadlineBeforeFirstShift:
+          for seat in 0 ..< state.sim.cogs.len:
+            if state.disconnected[seat] or not state.playerSockets.hasKey(seat):
+              disconnectedSeat = seat
+              disconnectedShift = state.sim.shift + 1
+              break
+            seats.add(seat)
+          if disconnectedSeat < 0:
+            simCopy = state.sim
+            prompts = state.prompts
+            scripted = state.scripted
+            external = state.external
+            log "shift " & $(state.sim.shift + 1) & " of " & $config.shifts &
+              " at " & $(epochTime() - gameStart).int & "s"
+
+      if deadlineBeforeFirstShift:
+        failEpisode(runtimeConfig, fkInfra, "play_deadline_before_first_shift",
+          "play deadline reached before shift 1 could start")
+        return
 
       if disconnectedSeat >= 0:
         failEpisode(runtimeConfig, fkInfra, "seat_disconnected",
           "seat " & $disconnectedSeat & " disconnected before shift " &
-          $(simCopy.shift + 1), disconnectedSeat)
+          $disconnectedShift, disconnectedSeat)
         return
 
       var hasExternal = false
@@ -496,11 +513,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.awaiting[seat] = true
             state.actions[seat] = nil
             if state.playerSockets.hasKey(seat):
-              state.playerSockets[seat].send($ %*{
-                "type": "observation",
-                "shift": simCopy.shift,
-                "observation": simCopy.observationJson(seat)
-              })
+              try:
+                state.playerSockets[seat].send($ %*{
+                  "type": "observation",
+                  "shift": simCopy.shift,
+                  "observation": simCopy.observationJson(seat)
+                })
+              except CatchableError:
+                state.playerSockets.del(seat)
+                state.disconnected[seat] = true
 
       var managedSeats: seq[int]
       for seat in seats:
@@ -551,7 +572,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           var failed = false
           withLock stateLock:
             for seat in seats:
-              if not state.playerSockets.hasKey(seat):
+              if state.disconnected[seat] or not state.playerSockets.hasKey(seat):
                 failed = true
                 break
               if external[seat]:
@@ -573,7 +594,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         extRejected = ""
       withLock stateLock:
         for index, seat in seats:
-          if not state.playerSockets.hasKey(seat):
+          if state.disconnected[seat] or not state.playerSockets.hasKey(seat):
             hasExtFailure = true
             extKind = fkInfra
             extCode = "seat_disconnected"
@@ -610,28 +631,27 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               extSeat = seat
               extRejected = cleanError($state.actions[seat])
               break
+        if not hasExtFailure:
+          for index, seat in seats:
+            var order = orders[index]
+            order.latencyMs = int(batchSeconds * 1000.0)
+            log "shift " & $(state.sim.shift + 1) & " " & Aliases[seat] &
+              " -> " & $order.job & " " & $order.cube & " (" & $order.source &
+              ")" & (if order.say.len > 0: " says \"" & order.say & "\"" else: "")
+            state.sim.applyOrder(seat, order)
+          ## The tick loop, with a spectator frame every few ticks.
+          for _ in 0 ..< config.ticksPerShift:
+            state.sim.stepTick()
+            if state.sim.tick mod BroadcastEveryTicks == 0:
+              state.broadcastLocked()
+          state.sim.closeShift()
+          state.sim.checkEnd(false)
+          state.sendPlayerStates()
+          state.broadcastLocked()
       if hasExtFailure:
         failEpisode(runtimeConfig, extKind, extCode, extMessage, extSeat,
           extRejected)
         return
-
-      withLock stateLock:
-        for index, seat in seats:
-          var order = orders[index]
-          order.latencyMs = int(batchSeconds * 1000.0)
-          log "shift " & $(state.sim.shift + 1) & " " & Aliases[seat] &
-            " -> " & $order.job & " " & $order.cube & " (" & $order.source &
-            ")" & (if order.say.len > 0: " says \"" & order.say & "\"" else: "")
-          state.sim.applyOrder(seat, order)
-        ## The tick loop, with a spectator frame every few ticks.
-        for _ in 0 ..< config.ticksPerShift:
-          state.sim.stepTick()
-          if state.sim.tick mod BroadcastEveryTicks == 0:
-            state.broadcastLocked()
-        state.sim.closeShift()
-        state.sim.checkEnd(false)
-        state.sendPlayerStates()
-        state.broadcastLocked()
 
       ## Floor the spacing between batch STARTS so the episode cannot exceed
       ## the Bedrock sidecar's 30 rpm per-episode ceiling.
@@ -757,11 +777,16 @@ proc websocketHandler(
           if control.isNil or control.kind != JString or
               control.getStr() != "external":
             raise newException(FactoryError, "unknown player control")
+          var ignored = false
           withLock stateLock:
-            state.external[slot] = true
-            state.scripted[slot] = skNone
-            state.registered[slot] = true
-          log "seat " & $slot & " registered external action control"
+            if state.started and state.registered[slot]:
+              ignored = true
+            else:
+              state.external[slot] = true
+              state.scripted[slot] = skNone
+              state.registered[slot] = true
+          if not ignored:
+            log "seat " & $slot & " registered external action control"
         of "action":
           withLock stateLock:
             if state.external[slot] and state.awaiting[slot]:
@@ -798,13 +823,18 @@ proc websocketHandler(
               if kind == skNone:
                 raise newException(FactoryError,
                   "unknown scripted baseline: " & cleanError(scriptedText))
+          var ignored = false
           withLock stateLock:
-            state.prompts[slot] = prompt
-            state.scripted[slot] = kind
-            state.external[slot] = false
-            state.registered[slot] = true
-          log "seat " & $slot & " delivered a prompt (" & $prompt.len &
-            " chars" & (if kind != skNone: ", scripted " & $kind else: "") & ")"
+            if state.started and state.registered[slot]:
+              ignored = true
+            else:
+              state.prompts[slot] = prompt
+              state.scripted[slot] = kind
+              state.external[slot] = false
+              state.registered[slot] = true
+          if not ignored:
+            log "seat " & $slot & " delivered a prompt (" & $prompt.len &
+              " chars" & (if kind != skNone: ", scripted " & $kind else: "") & ")"
         else:
           raise newException(FactoryError,
             "unknown player frame type: " & cleanError(frameType.getStr()))
@@ -825,6 +855,9 @@ proc websocketHandler(
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
+            if state.started and not state.finished and
+                slot >= 0 and slot < state.disconnected.len:
+              state.disconnected[slot] = true
         state.globalSockets.excl(websocket)
         state.viewerStates.del(websocket)
 
@@ -851,6 +884,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.scripted = newSeq[ScriptKind](config.numAgents)
   state.external = newSeq[bool](config.numAgents)
   state.registered = newSeq[bool](config.numAgents)
+  state.disconnected = newSeq[bool](config.numAgents)
   state.awaiting = newSeq[bool](config.numAgents)
   state.actions = newSeq[JsonNode](config.numAgents)
   state.rejected = newSeq[string](config.numAgents)

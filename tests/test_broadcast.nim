@@ -161,7 +161,7 @@ block terminalFrameCarriesTheVerdict:
     "the end card is STATE, so a viewer who seeks straight to the end sees it"
   let over = frame["over"]
   check over["ending"].getStr() in
-    ["shift_limit", "factory_ruined", "deadline", "forfeit"],
+    ["shift_limit", "factory_ruined", "deadline"],
     "the ending string is legal, got " & over["ending"].getStr()
   check over.hasKey("scrapped_by"), "and names who broke it, or -1"
   check over.hasKey("winner") and over.hasKey("draw"),

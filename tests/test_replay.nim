@@ -61,10 +61,10 @@ block resultsShape:
       "results.names carries the POLICY name, platform side"
     check results["aliases"][seat].getStr() == Aliases[seat],
       "results.aliases carries the in-game alias"
-  check results["reason"].getStr() in ["complete", "deadline", "forfeit"],
-    "results.reason is one of the three legal values"
+  check results["reason"].getStr() in ["complete", "deadline"],
+    "results.reason is one of the two legal values"
   check results["ending"].getStr() in
-    ["shift_limit", "factory_ruined", "deadline", "forfeit"],
+    ["shift_limit", "factory_ruined", "deadline"],
     "results.ending is legal"
   check results["band_final"].getStr() in
     ["PRIME", "WORN", "FAILING", "CRITICAL", "SEIZED", "SCRAP"],

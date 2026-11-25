@@ -242,8 +242,8 @@ type
     beats*: seq[JsonNode]
     history*: seq[ShiftRecord]
     done*: bool
-    reason*: string                ## complete | deadline | forfeit
-    ending*: string                ## shift_limit | factory_ruined | deadline | forfeit
+    reason*: string                ## complete | deadline
+    ending*: string                ## shift_limit | factory_ruined | deadline
     connected*: seq[bool]
     lastBlocked*: seq[string]      ## per-seat `blocked` dedupe key (record
                                    ## keeping, never state: excluded from

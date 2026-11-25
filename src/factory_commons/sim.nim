@@ -290,7 +290,7 @@ proc finish(sim: var Sim, reason, ending: string) =
 
 proc checkEnd*(sim: var Sim, deadlineReached: bool) =
   ## The episode ends at the FIRST of these, all checked at a shift boundary.
-  ## `complete`, `deadline` and `forfeit` are the only legal reasons — a
+  ## `complete` and `deadline` are the only legal completed-episode reasons — a
   ## ruined factory is a COMPLETED game of Factory Commons, not an error.
   if sim.done:
     return
@@ -308,14 +308,6 @@ proc endEarly*(sim: var Sim) =
   ## The platform keeps NOTHING from an episode that outruns its timeout, so
   ## giving up shifts is always better than giving up the whole result.
   sim.finish("deadline", "deadline")
-
-proc forfeit*(sim: var Sim) =
-  ## Pre-existing rule (`docs/plans/2026-08-25-factory-commons-design.md:348`,
-  ## `coworld_manifest_template.json:464`): ONLY when no seat connected within
-  ## `playerConnectTimeoutSeconds = 180`. Results AND the replay are written.
-  if sim.frames.len == 0:
-    sim.captureFrame()
-  sim.finish("forfeit", "forfeit")
 
 proc playShift*(sim: var Sim) =
   ## One turn: `ticksPerShift` ticks, then the shift close.

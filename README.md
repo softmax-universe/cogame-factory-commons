@@ -90,8 +90,8 @@ missed action deadlines, missing LLM credentials on a prompt seat, provider or
 transport errors, or mid-episode seat disconnects terminate the unfinished
 episode unscored with failure diagnostics (distinguishing infrastructure errors
 from model-generated invalid actions) instead of silently substituting a
-scripted move or inventing a forfeit score. Only the pre-existing 0-seat
-connect timeout rule forfeits an episode.
+scripted move or inventing a forfeit score (including when zero or partial seats
+connect within the startup timeout).
 
 The three baselines are `steward`, `stripper` (the exploiter) and `freerider`
 (the camper). `steward` and `stripper` are the league fillers, so every

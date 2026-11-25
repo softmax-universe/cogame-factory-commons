@@ -437,17 +437,6 @@ proc disabledClientFailsPromptSeatsAndAllowsScripted() =
   check errKind == fkInfra and errCode == "llm_missing_credentials",
     "missing credentials classified as infra / llm_missing_credentials"
 
-block forfeitProducesValidReplay:
-  let config = baseConfig()
-  var sim = initSim(config)
-  sim.forfeit()
-  let results = sim.resultsJson(@["a", "b", "c"])
-  check results["reason"].getStr() == "forfeit", "forfeit reason recorded"
-  check results["ending"].getStr() == "forfeit", "forfeit ending recorded"
-  let replayBytes = buildReplay(sim, @["a", "b", "c"], results)
-  let doc = parseReplay(replayBytes)
-  check doc.frames.len >= 1, "shift-0 forfeit replay carries an initial frame"
-
 block pacingHonoursMinTurnSeconds:
   var config = baseConfig()
   config.minTurnSeconds = 12
